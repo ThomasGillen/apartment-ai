@@ -35,9 +35,9 @@ same validation and output path.
 | --- | --- | --- |
 | `llama.cpp` | Build `llama-server` with CUDA | Keep one server process running |
 | Qwen3-4B | Downloaded automatically on first server launch | Loaded from the local cache |
-| `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for each recording |
+| `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
-| Python project | Create `.venv` and install requirements | Run `apartment_controller.py --voice` |
+| Python project | Create `.venv` and install requirements | Run push-to-talk or wake-listen mode |
 
 After setup, normal operation still uses only two terminals: one for
 `llama-server` and one for the apartment controller. Whisper does not need its
@@ -303,7 +303,7 @@ cd ~/llama.cpp
 Leave this terminal running. The first launch needs internet access while Qwen
 is downloaded; subsequent launches use the cached model.
 
-### Terminal 2: start the apartment controller
+### Terminal 2 option A: push-to-talk mode
 
 For the default microphone:
 
@@ -339,6 +339,50 @@ python apartment_controller.py --voice --record-seconds 7
 Typing text at the voice prompt bypasses recording for that command. Type
 `exit` or `quit`, or press Ctrl+C, to stop. The cleanup path leaves the LED off.
 
+### Terminal 2 option B: continuous wake-word mode
+
+The continuous mode uses the same build and model; it needs no additional
+server or terminal:
+
+```bash
+cd ~/apartment-ai
+source .venv/bin/activate
+python apartment_controller.py --wake-listen
+```
+
+The default wake word is `command`. Use it in two stages:
+
+1. Say “command.”
+2. Wait for the terminal bell and `Recording command... speak now.` message.
+3. Say “turn on my desk lamp.”
+
+The microphone remains open through one `arecord` process. Python continuously
+buffers local audio while Whisper examines overlapping two-second windows. When
+the wake word is detected, old buffered audio is discarded and a fresh
+five-second command is recorded. Only that post-wake transcript enters the
+Qwen interpretation, validation, and GPIO path.
+
+Use a more distinctive wake phrase if `command` triggers too easily:
+
+```bash
+python apartment_controller.py \
+  --wake-listen \
+  --wake-word "hey apartment"
+```
+
+For a non-default microphone or a longer wake-detection window:
+
+```bash
+python apartment_controller.py \
+  --wake-listen \
+  --microphone plughw:2,0 \
+  --wake-window-seconds 3
+```
+
+Wake-listen mode performs more Whisper inference than push-to-talk, so it keeps
+the Jetson busier. All audio and temporary transcripts remain local and are
+deleted after each check. Press Ctrl+C to stop.
+
 ### Text-only mode
 
 The original text input remains available:
@@ -370,6 +414,9 @@ python apartment_controller.py --help
 ```
 
 - `--voice` enables push-to-talk input.
+- `--wake-listen` (or `--always-listen`) enables continuous wake-word mode.
+- `--wake-word PHRASE` changes the default `command` wake phrase.
+- `--wake-window-seconds N` changes the wake-detection audio window.
 - `--microphone plughw:CARD,DEVICE` selects an ALSA capture device.
 - `--record-seconds N` changes the recording window.
 - `--language auto` enables Whisper language detection.
@@ -414,6 +461,13 @@ If `whisper.cpp` is installed elsewhere, supply `--whisper-bin` and
 Run `arecord -l`, test the device with a short recording, and pass its
 `plughw:CARD,DEVICE` value through `--microphone`.
 
+### Wake word is missed or triggers accidentally
+
+Speak the wake phrase by itself and wait for the ready message before saying the
+apartment command. Try a distinctive phrase such as `hey apartment`, or increase
+`--wake-window-seconds` from 2 to 3. Push-to-talk mode remains available when
+continuous Whisper scanning uses too much GPU time.
+
 ### GPIO permission error
 
 Run `groups` and confirm that `gpio` is present. If it is missing after running
@@ -446,7 +500,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 ## Next milestones
 
 - Stop recording automatically when speech ends
-- Optional wake word and always-listening mode
+- Replace continuous Whisper scanning with a smaller dedicated wake-word model
 - Text-to-speech confirmation
 - Home Assistant integration
 - Smart plugs and multiple lights

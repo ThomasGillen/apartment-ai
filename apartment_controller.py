@@ -1,8 +1,13 @@
 import argparse
 import json
+import queue
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import wave
 from pathlib import Path
 
 
@@ -10,6 +15,15 @@ DEFAULT_LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
 DEFAULT_LED_PIN = 7
 DEFAULT_WHISPER_BIN = "~/whisper.cpp/build/bin/whisper-cli"
 DEFAULT_WHISPER_MODEL = "~/whisper.cpp/models/ggml-base.en.bin"
+DEFAULT_WAKE_WORD = "command"
+DEFAULT_WAKE_WINDOW_SECONDS = 2
+
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_SAMPLE_WIDTH = 2
+WHISPER_COMMAND_PROMPT = (
+    "A spoken apartment command, such as turn the desk lamp on or off."
+)
 
 SYSTEM_PROMPT = """
 You control an apartment.
@@ -44,6 +58,134 @@ ALLOWED_COMMANDS = {
 
 class ControllerError(RuntimeError):
     """An expected controller error that can be shown to the user."""
+
+
+class AlsaAudioStream:
+    """Continuously drain raw microphone audio from a single arecord process."""
+
+    def __init__(self, microphone=None, frame_ms=100, max_buffer_seconds=10):
+        self.microphone = microphone
+        self.frame_bytes = (
+            AUDIO_SAMPLE_RATE
+            * AUDIO_CHANNELS
+            * AUDIO_SAMPLE_WIDTH
+            * frame_ms
+            // 1000
+        )
+        frame_capacity = max(1, max_buffer_seconds * 1000 // frame_ms)
+        self.frames = queue.Queue(maxsize=frame_capacity)
+        self.process = None
+        self.reader_thread = None
+        self.stop_event = threading.Event()
+
+    def start(self):
+        if self.process is not None and self.process.poll() is None:
+            return
+
+        command = [
+            "arecord",
+            "--quiet",
+            "--format",
+            "S16_LE",
+            "--rate",
+            str(AUDIO_SAMPLE_RATE),
+            "--channels",
+            str(AUDIO_CHANNELS),
+            "--file-type",
+            "raw",
+        ]
+        if self.microphone:
+            command.extend(["--device", self.microphone])
+        command.append("-")
+
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise ControllerError(
+                f"Could not start continuous microphone capture: {error}"
+            ) from error
+
+        self.stop_event.clear()
+        self.reader_thread = threading.Thread(
+            target=self._read_audio,
+            name="alsa-audio-reader",
+            daemon=True,
+        )
+        self.reader_thread.start()
+
+    def _read_audio(self):
+        while not self.stop_event.is_set():
+            data = self.process.stdout.read(self.frame_bytes)
+            if not data:
+                break
+
+            try:
+                self.frames.put_nowait(data)
+            except queue.Full:
+                try:
+                    self.frames.get_nowait()
+                except queue.Empty:
+                    pass
+                self.frames.put_nowait(data)
+
+    def read_seconds(self, seconds):
+        self.start()
+        bytes_needed = int(
+            seconds * AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH
+        )
+        audio = bytearray()
+        deadline = time.monotonic() + seconds + 10
+
+        while len(audio) < bytes_needed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ControllerError("Timed out while reading microphone audio.")
+
+            try:
+                audio.extend(self.frames.get(timeout=min(1, remaining)))
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    raise ControllerError(self._process_error())
+
+        return bytes(audio[:bytes_needed])
+
+    def discard_buffer(self):
+        while True:
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                return
+
+    def _process_error(self):
+        detail = self.process.stderr.read().decode(errors="replace").strip()
+        if detail:
+            lines = detail.splitlines()
+            summary = lines[0]
+            if len(lines) > 1 and lines[-1] != summary:
+                summary = f"{summary} ({lines[-1]})"
+            return f"Continuous microphone capture stopped: {summary}"
+        return "Continuous microphone capture stopped unexpectedly."
+
+    def close(self):
+        self.stop_event.set()
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+
+        if self.reader_thread is not None:
+            self.reader_thread.join(timeout=2)
+
+        self.process = None
+        self.reader_thread = None
+        self.discard_buffer()
 
 
 class WhisperVoiceInput:
@@ -82,7 +224,8 @@ class WhisperVoiceInput:
                 f"Whisper model not found: {self.whisper_model}"
             )
 
-    def listen(self):
+    def listen(self, record_seconds=None):
+        duration = record_seconds or self.record_seconds
         with tempfile.TemporaryDirectory(prefix="apartment-voice-") as temp_dir:
             temp_path = Path(temp_dir)
             recording_path = temp_path / "command.wav"
@@ -94,11 +237,11 @@ class WhisperVoiceInput:
                 "--format",
                 "S16_LE",
                 "--rate",
-                "16000",
+                str(AUDIO_SAMPLE_RATE),
                 "--channels",
-                "1",
+                str(AUDIO_CHANNELS),
                 "--duration",
-                str(self.record_seconds),
+                str(duration),
             ]
 
             if self.microphone:
@@ -106,44 +249,70 @@ class WhisperVoiceInput:
 
             record_command.append(str(recording_path))
 
-            print(f"Recording for {self.record_seconds} seconds... speak now.")
+            print(f"Recording for {duration} seconds... speak now.")
             self._run(
                 record_command,
                 "Could not record from the microphone",
-                timeout=self.record_seconds + 10,
+                timeout=duration + 10,
             )
             print("Transcribing locally...")
 
-            whisper_command = [
-                str(self.whisper_bin),
-                "--model",
-                str(self.whisper_model),
-                "--file",
-                str(recording_path),
-                "--language",
-                self.language,
-                "--no-timestamps",
-                "--no-prints",
-                "--suppress-nst",
-                "--output-txt",
-                "--output-file",
-                str(transcript_path),
-                "--prompt",
-                "A spoken apartment command, such as turn the desk lamp on or off.",
-            ]
-            self._run(
-                whisper_command,
-                "whisper.cpp could not transcribe the recording",
-                timeout=self.timeout,
+            return self._transcribe(
+                recording_path,
+                transcript_path,
+                prompt=WHISPER_COMMAND_PROMPT,
             )
 
-            output_file = transcript_path.with_suffix(".txt")
-            if not output_file.is_file():
-                raise ControllerError(
-                    "whisper.cpp finished without creating a transcript."
-                )
+    def transcribe_pcm(self, pcm_audio, prompt=None, announce=False):
+        with tempfile.TemporaryDirectory(prefix="apartment-voice-") as temp_dir:
+            temp_path = Path(temp_dir)
+            recording_path = temp_path / "stream.wav"
+            transcript_path = temp_path / "transcript"
 
-            return output_file.read_text(encoding="utf-8").strip()
+            with wave.open(str(recording_path), "wb") as wav_file:
+                wav_file.setnchannels(AUDIO_CHANNELS)
+                wav_file.setsampwidth(AUDIO_SAMPLE_WIDTH)
+                wav_file.setframerate(AUDIO_SAMPLE_RATE)
+                wav_file.writeframes(pcm_audio)
+
+            if announce:
+                print("Transcribing locally...")
+
+            return self._transcribe(recording_path, transcript_path, prompt=prompt)
+
+    def _transcribe(self, recording_path, transcript_path, prompt=None):
+        whisper_command = [
+            str(self.whisper_bin),
+            "--model",
+            str(self.whisper_model),
+            "--file",
+            str(recording_path),
+            "--language",
+            self.language,
+            "--no-timestamps",
+            "--no-prints",
+            "--suppress-nst",
+            "--no-fallback",
+            "--output-txt",
+            "--output-file",
+            str(transcript_path),
+        ]
+        if prompt:
+            whisper_command.extend(["--prompt", prompt])
+
+        self._run(
+            whisper_command,
+            "whisper.cpp could not transcribe the recording",
+            timeout=self.timeout,
+        )
+
+        output_file = transcript_path.with_suffix(".txt")
+        if not output_file.is_file():
+            raise ControllerError(
+                "whisper.cpp finished without creating a transcript."
+            )
+
+        return output_file.read_text(encoding="utf-8").strip()
 
     @staticmethod
     def _run(command, error_prefix, timeout):
@@ -166,6 +335,95 @@ class WhisperVoiceInput:
                 detail = detail.splitlines()[-1]
                 raise ControllerError(f"{error_prefix}: {detail}")
             raise ControllerError(error_prefix)
+
+
+class WakeWordInput:
+    """Scan a continuous microphone stream, then capture a command on wake."""
+
+    def __init__(
+        self,
+        voice_input,
+        wake_word=DEFAULT_WAKE_WORD,
+        window_seconds=DEFAULT_WAKE_WINDOW_SECONDS,
+        stream_factory=AlsaAudioStream,
+    ):
+        normalized_wake_word = self._normalize(wake_word)
+        if not normalized_wake_word:
+            raise ControllerError("The wake word must contain a letter or number.")
+
+        self.voice_input = voice_input
+        self.wake_word = wake_word
+        self.normalized_wake_word = normalized_wake_word
+        self.window_seconds = window_seconds
+        self.stream = stream_factory(microphone=voice_input.microphone)
+        self.announced = False
+
+    def listen(self):
+        self.stream.start()
+        if self.announced:
+            # Audio captured while the previous command was interpreted is stale.
+            self.stream.discard_buffer()
+        if not self.announced:
+            print(
+                f'Listening continuously for wake word "{self.wake_word}". '
+                "Press Ctrl+C to stop."
+            )
+            self.announced = True
+
+        overlap_bytes = (
+            min(1, self.window_seconds)
+            * AUDIO_SAMPLE_RATE
+            * AUDIO_CHANNELS
+            * AUDIO_SAMPLE_WIDTH
+        )
+        previous_audio = b""
+
+        while True:
+            wake_audio = self.stream.read_seconds(self.window_seconds)
+            wake_transcript = self.voice_input.transcribe_pcm(
+                previous_audio + wake_audio
+            )
+
+            if not self._contains_wake_word(wake_transcript):
+                previous_audio = wake_audio[-overlap_bytes:]
+                continue
+
+            # Drop anything captured while Whisper was detecting the wake word.
+            # This makes the next recording begin after the ready message.
+            self.stream.discard_buffer()
+            print(
+                f'\aWake word detected in: "{wake_transcript}"\n'
+                f"Recording command for {self.voice_input.record_seconds} "
+                "seconds... speak now."
+            )
+            command_audio = self.stream.read_seconds(
+                self.voice_input.record_seconds
+            )
+            transcript = self.voice_input.transcribe_pcm(
+                command_audio,
+                prompt=WHISPER_COMMAND_PROMPT,
+                announce=True,
+            )
+
+            if transcript:
+                print(f'Heard: "{transcript}"')
+            else:
+                print("No speech detected. Resuming wake-word listening.\n")
+            return transcript
+
+    def _contains_wake_word(self, transcript):
+        normalized_transcript = self._normalize(transcript)
+        return (
+            f" {self.normalized_wake_word} "
+            in f" {normalized_transcript} "
+        )
+
+    @staticmethod
+    def _normalize(text):
+        return " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+
+    def close(self):
+        self.stream.close()
 
 
 class GpioLed:
@@ -263,7 +521,10 @@ def validate_command(command):
     return device, action
 
 
-def read_command(voice_input=None):
+def read_command(voice_input=None, wake_input=None):
+    if wake_input is not None:
+        return wake_input.listen()
+
     if voice_input is None:
         return input("Command: ").strip()
 
@@ -285,20 +546,42 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Control the apartment LED using typed or spoken commands."
     )
-    parser.add_argument(
+    input_mode = parser.add_mutually_exclusive_group()
+    input_mode.add_argument(
         "--voice",
         action="store_true",
         help="enable local push-to-talk input through whisper.cpp",
+    )
+    input_mode.add_argument(
+        "--wake-listen",
+        "--always-listen",
+        dest="wake_listen",
+        action="store_true",
+        help="continuously listen for a wake word before recording a command",
     )
     parser.add_argument(
         "--record-seconds",
         type=int,
         default=5,
-        help="seconds to record after Enter is pressed (default: 5)",
+        help="seconds to record for each spoken command (default: 5)",
     )
     parser.add_argument(
         "--microphone",
         help="optional ALSA capture device, for example plughw:2,0",
+    )
+    parser.add_argument(
+        "--wake-word",
+        default=DEFAULT_WAKE_WORD,
+        help=f"wake phrase for --wake-listen (default: {DEFAULT_WAKE_WORD})",
+    )
+    parser.add_argument(
+        "--wake-window-seconds",
+        type=int,
+        default=DEFAULT_WAKE_WINDOW_SECONDS,
+        help=(
+            "audio window used to detect the wake phrase "
+            f"(default: {DEFAULT_WAKE_WINDOW_SECONDS})"
+        ),
     )
     parser.add_argument(
         "--whisper-bin",
@@ -330,6 +613,10 @@ def parse_args(argv=None):
 
     if args.record_seconds < 1:
         parser.error("--record-seconds must be at least 1")
+    if args.wake_window_seconds < 1:
+        parser.error("--wake-window-seconds must be at least 1")
+    if not WakeWordInput._normalize(args.wake_word):
+        parser.error("--wake-word must contain a letter or number")
 
     return args
 
@@ -337,10 +624,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     voice_input = None
+    wake_input = None
     led = None
 
     try:
-        if args.voice:
+        if args.voice or args.wake_listen:
             voice_input = WhisperVoiceInput(
                 whisper_bin=args.whisper_bin,
                 whisper_model=args.whisper_model,
@@ -350,10 +638,22 @@ def main(argv=None):
             )
             voice_input.check_ready()
 
+        if args.wake_listen:
+            wake_input = WakeWordInput(
+                voice_input=voice_input,
+                wake_word=args.wake_word,
+                window_seconds=args.wake_window_seconds,
+            )
+
         led = GpioLed(args.led_pin)
 
         print("Apartment controller started.")
-        if args.voice:
+        if args.wake_listen:
+            print(
+                f'Wake-word input enabled. Say "{args.wake_word}", wait for '
+                "the ready message, then speak the command."
+            )
+        elif args.voice:
             print("Voice input enabled. Press Enter when you are ready to speak.")
         else:
             print("Text input enabled.")
@@ -361,9 +661,16 @@ def main(argv=None):
 
         while True:
             try:
-                user_text = read_command(voice_input)
+                user_text = read_command(
+                    voice_input=voice_input if args.voice else None,
+                    wake_input=wake_input,
+                )
             except ControllerError as error:
                 print(f"{error}\n")
+                if wake_input is not None:
+                    wake_input.close()
+                    print("Restarting the wake listener in two seconds.\n")
+                    time.sleep(2)
                 continue
 
             if user_text.lower() in {"exit", "quit"}:
@@ -385,6 +692,8 @@ def main(argv=None):
     except (KeyboardInterrupt, EOFError):
         print("\nStopping apartment controller.")
     finally:
+        if wake_input is not None:
+            wake_input.close()
         if led is not None:
             led.cleanup()
             print("GPIO cleaned up.")
