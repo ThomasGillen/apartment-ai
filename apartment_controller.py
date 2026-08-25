@@ -17,6 +17,7 @@ DEFAULT_WHISPER_BIN = "~/whisper.cpp/build/bin/whisper-cli"
 DEFAULT_WHISPER_MODEL = "~/whisper.cpp/models/ggml-base.en.bin"
 DEFAULT_WAKE_WORD = "command"
 DEFAULT_WAKE_WINDOW_SECONDS = 2
+DEFAULT_TTS_MODEL = "~/apartment-ai/voices/en_US-lessac-medium.onnx"
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -337,6 +338,119 @@ class WhisperVoiceInput:
             raise ControllerError(error_prefix)
 
 
+class PiperSpeechOutput:
+    """Synthesize responses with Piper and play them through Linux audio."""
+
+    def __init__(
+        self,
+        model_path,
+        playback_device=None,
+        voice_loader=None,
+        player_runner=None,
+    ):
+        self.model_path = Path(model_path).expanduser()
+        self.config_path = Path(f"{self.model_path}.json")
+        self.playback_device = playback_device
+        self.player_runner = player_runner or subprocess.run
+
+        self.players = self._available_players()
+        if not self.players:
+            raise ControllerError(
+                "Speech output needs paplay, pw-play, or aplay. Install the "
+                "PulseAudio, PipeWire, or ALSA command-line utilities."
+            )
+        if not self.model_path.is_file():
+            raise ControllerError(f"Piper voice model not found: {self.model_path}")
+        if not self.config_path.is_file():
+            raise ControllerError(
+                f"Piper voice configuration not found: {self.config_path}"
+            )
+
+        if voice_loader is None:
+            try:
+                from piper import PiperVoice
+            except ImportError as error:
+                raise ControllerError(
+                    "Speech output needs the 'piper-tts' Python package."
+                ) from error
+            voice_loader = PiperVoice.load
+
+        try:
+            # Keep Piper on the CPU so Qwen and Whisper retain the Jetson GPU.
+            self.voice = voice_loader(str(self.model_path), use_cuda=False)
+        except Exception as error:
+            raise ControllerError(f"Could not load Piper voice: {error}") from error
+
+    def _available_players(self):
+        if self.playback_device:
+            if shutil.which("aplay") is None:
+                raise ControllerError(
+                    "--speaker-device selects an ALSA device and needs 'aplay'."
+                )
+            return ["aplay"]
+
+        # paplay and pw-play follow the desktop's selected system output, which
+        # includes Bluetooth sinks. aplay remains a fallback for direct ALSA.
+        return [
+            player
+            for player in ("paplay", "pw-play", "aplay")
+            if shutil.which(player) is not None
+        ]
+
+    def _play_command(self, player, speech_path):
+        if player == "aplay":
+            command = ["aplay", "--quiet"]
+            if self.playback_device:
+                command.extend(["--device", self.playback_device])
+            command.append(str(speech_path))
+            return command
+
+        return [player, str(speech_path)]
+
+    def speak(self, text):
+        text = text.strip()
+        if not text:
+            return
+
+        with tempfile.TemporaryDirectory(prefix="apartment-speech-") as temp_dir:
+            speech_path = Path(temp_dir) / "response.wav"
+            try:
+                with wave.open(str(speech_path), "wb") as wav_file:
+                    self.voice.synthesize_wav(text, wav_file)
+            except Exception as error:
+                raise ControllerError(
+                    f"Could not synthesize speech response: {error}"
+                ) from error
+
+            failures = []
+            for player in self.players:
+                play_command = self._play_command(player, speech_path)
+                try:
+                    result = self.player_runner(
+                        play_command,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    failures.append(f"{player}: {error}")
+                    continue
+
+                if result.returncode == 0:
+                    return
+
+                detail = (result.stderr or result.stdout).strip()
+                if detail:
+                    failures.append(f"{player}: {detail.splitlines()[-1]}")
+                else:
+                    failures.append(f"{player}: playback failed")
+
+            raise ControllerError(
+                "Could not play speech response: " + "; ".join(failures)
+            )
+
+
 class WakeWordInput:
     """Scan a continuous microphone stream, then capture a command on wake."""
 
@@ -345,6 +459,7 @@ class WakeWordInput:
         voice_input,
         wake_word=DEFAULT_WAKE_WORD,
         window_seconds=DEFAULT_WAKE_WINDOW_SECONDS,
+        speech_output=None,
         stream_factory=AlsaAudioStream,
     ):
         normalized_wake_word = self._normalize(wake_word)
@@ -355,6 +470,7 @@ class WakeWordInput:
         self.wake_word = wake_word
         self.normalized_wake_word = normalized_wake_word
         self.window_seconds = window_seconds
+        self.speech_output = speech_output
         self.stream = stream_factory(microphone=voice_input.microphone)
         self.announced = False
 
@@ -391,8 +507,13 @@ class WakeWordInput:
             # Drop anything captured while Whisper was detecting the wake word.
             # This makes the next recording begin after the ready message.
             self.stream.discard_buffer()
+            print(f'\aWake word detected in: "{wake_transcript}"')
+            if self.speech_output is not None:
+                self.speech_output.speak("Ready.")
+                # Prevent the spoken response from entering the command audio.
+                self.stream.discard_buffer()
+
             print(
-                f'\aWake word detected in: "{wake_transcript}"\n'
                 f"Recording command for {self.voice_input.record_seconds} "
                 "seconds... speak now."
             )
@@ -445,7 +566,7 @@ class GpioLed:
     def apply(self, device, action):
         if device == "none":
             print("No apartment action requested.\n")
-            return
+            return None
 
         if device != "desk_lamp":
             raise ControllerError(f"No output is configured for device: {device}")
@@ -453,9 +574,13 @@ class GpioLed:
         if action == "on":
             self.gpio.output(self.pin, self.gpio.HIGH)
             print(">>> DESK LAMP ON\n")
+            return "Desk lamp turned on."
         elif action == "off":
             self.gpio.output(self.pin, self.gpio.LOW)
             print(">>> DESK LAMP OFF\n")
+            return "Desk lamp turned off."
+
+        return None
 
     def cleanup(self):
         self.gpio.output(self.pin, self.gpio.LOW)
@@ -584,6 +709,20 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--speak",
+        action="store_true",
+        help="speak local ready and action responses with Piper",
+    )
+    parser.add_argument(
+        "--tts-model",
+        default=DEFAULT_TTS_MODEL,
+        help=f"path to a Piper ONNX voice model (default: {DEFAULT_TTS_MODEL})",
+    )
+    parser.add_argument(
+        "--speaker-device",
+        help="force a direct ALSA playback device, for example plughw:3,0",
+    )
+    parser.add_argument(
         "--whisper-bin",
         default=DEFAULT_WHISPER_BIN,
         help=f"path to whisper-cli (default: {DEFAULT_WHISPER_BIN})",
@@ -625,6 +764,7 @@ def main(argv=None):
     args = parse_args(argv)
     voice_input = None
     wake_input = None
+    speech_output = None
     led = None
 
     try:
@@ -638,11 +778,19 @@ def main(argv=None):
             )
             voice_input.check_ready()
 
+        if args.speak:
+            print("Loading local Piper voice...")
+            speech_output = PiperSpeechOutput(
+                model_path=args.tts_model,
+                playback_device=args.speaker_device,
+            )
+
         if args.wake_listen:
             wake_input = WakeWordInput(
                 voice_input=voice_input,
                 wake_word=args.wake_word,
                 window_seconds=args.wake_window_seconds,
+                speech_output=speech_output,
             )
 
         led = GpioLed(args.led_pin)
@@ -657,6 +805,8 @@ def main(argv=None):
             print("Voice input enabled. Press Enter when you are ready to speak.")
         else:
             print("Text input enabled.")
+        if speech_output is not None:
+            print("Local speech responses enabled.")
         print("Type 'exit' or 'quit' to stop.\n")
 
         while True:
@@ -682,9 +832,16 @@ def main(argv=None):
 
             try:
                 device, action = interpret_command(user_text, args.llm_url)
-                led.apply(device, action)
+                action_response = led.apply(device, action)
             except ControllerError as error:
                 print(f"{error}\n")
+                continue
+
+            if speech_output is not None and action_response:
+                try:
+                    speech_output.speak(action_response)
+                except ControllerError as error:
+                    print(f"Speech response failed: {error}\n")
 
     except ControllerError as error:
         print(f"Startup error: {error}")

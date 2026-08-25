@@ -1,5 +1,6 @@
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -7,6 +8,8 @@ from unittest.mock import Mock, patch
 from apartment_controller import (
     AlsaAudioStream,
     ControllerError,
+    GpioLed,
+    PiperSpeechOutput,
     WakeWordInput,
     WhisperVoiceInput,
     interpret_command,
@@ -156,6 +159,150 @@ class WakeWordInputTests(unittest.TestCase):
 
         self.assertFalse(wake_input._contains_wake_word("commander reporting"))
         self.assertTrue(wake_input._contains_wake_word("Command, please"))
+
+    def test_says_ready_then_discards_its_own_speaker_audio(self):
+        stream = Mock()
+        stream.read_seconds.side_effect = [b"wake", b"command"]
+        voice = Mock(microphone=None, record_seconds=5)
+        voice.transcribe_pcm.side_effect = ["command", "lights on"]
+        speech_output = Mock()
+        wake_input = WakeWordInput(
+            voice_input=voice,
+            speech_output=speech_output,
+            stream_factory=Mock(return_value=stream),
+        )
+
+        transcript = wake_input.listen()
+
+        self.assertEqual(transcript, "lights on")
+        speech_output.speak.assert_called_once_with("Ready.")
+        self.assertEqual(stream.discard_buffer.call_count, 2)
+
+
+class SpeechOutputTests(unittest.TestCase):
+    @staticmethod
+    def _write_test_audio(_text, wav_file):
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(22050)
+        wav_file.writeframes(b"\x00\x00")
+
+    @patch("apartment_controller.shutil.which")
+    def test_loads_piper_on_cpu_and_plays_selected_alsa_device(self, which):
+        which.side_effect = lambda player: (
+            "/usr/bin/aplay" if player == "aplay" else None
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "voice.onnx"
+            model_path.write_bytes(b"model")
+            Path(f"{model_path}.json").write_text("{}", encoding="utf-8")
+
+            voice = Mock()
+
+            def synthesize(text, wav_file):
+                self.assertEqual(text, "Ready.")
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(22050)
+                wav_file.writeframes(b"\x00\x00")
+
+            voice.synthesize_wav.side_effect = synthesize
+            voice_loader = Mock(return_value=voice)
+            player_runner = Mock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            speech_output = PiperSpeechOutput(
+                model_path=model_path,
+                playback_device="plughw:3,0",
+                voice_loader=voice_loader,
+                player_runner=player_runner,
+            )
+
+            speech_output.speak("Ready.")
+
+            voice_loader.assert_called_once_with(str(model_path), use_cuda=False)
+            play_command = player_runner.call_args.args[0]
+            self.assertIn("--device", play_command)
+            self.assertIn("plughw:3,0", play_command)
+            self.assertEqual(Path(play_command[-1]).name, "response.wav")
+
+    @patch("apartment_controller.shutil.which")
+    def test_prefers_system_audio_for_bluetooth_output(self, which):
+        available = {
+            "paplay": "/usr/bin/paplay",
+            "pw-play": "/usr/bin/pw-play",
+            "aplay": "/usr/bin/aplay",
+        }
+        which.side_effect = available.get
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "voice.onnx"
+            model_path.write_bytes(b"model")
+            Path(f"{model_path}.json").write_text("{}", encoding="utf-8")
+            voice = Mock()
+            voice.synthesize_wav.side_effect = self._write_test_audio
+            player_runner = Mock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            speech_output = PiperSpeechOutput(
+                model_path=model_path,
+                voice_loader=Mock(return_value=voice),
+                player_runner=player_runner,
+            )
+
+            speech_output.speak("Ready.")
+
+            play_command = player_runner.call_args.args[0]
+            self.assertEqual(play_command[0], "paplay")
+            self.assertEqual(Path(play_command[-1]).name, "response.wav")
+
+    @patch("apartment_controller.shutil.which")
+    def test_falls_back_when_first_system_player_fails(self, which):
+        available = {
+            "paplay": "/usr/bin/paplay",
+            "pw-play": "/usr/bin/pw-play",
+        }
+        which.side_effect = available.get
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "voice.onnx"
+            model_path.write_bytes(b"model")
+            Path(f"{model_path}.json").write_text("{}", encoding="utf-8")
+            voice = Mock()
+            voice.synthesize_wav.side_effect = self._write_test_audio
+            player_runner = Mock(
+                side_effect=[
+                    subprocess.CompletedProcess([], 1, "", "no Pulse server"),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                ]
+            )
+            speech_output = PiperSpeechOutput(
+                model_path=model_path,
+                voice_loader=Mock(return_value=voice),
+                player_runner=player_runner,
+            )
+
+            speech_output.speak("Ready.")
+
+            self.assertEqual(player_runner.call_count, 2)
+            self.assertEqual(player_runner.call_args_list[0].args[0][0], "paplay")
+            self.assertEqual(player_runner.call_args_list[1].args[0][0], "pw-play")
+
+
+class GpioLedTests(unittest.TestCase):
+    def test_returns_fixed_spoken_confirmation_after_action(self):
+        led = GpioLed.__new__(GpioLed)
+        led.gpio = Mock(HIGH=1, LOW=0)
+        led.pin = 7
+
+        self.assertEqual(
+            led.apply("desk_lamp", "on"),
+            "Desk lamp turned on.",
+        )
+        self.assertEqual(
+            led.apply("desk_lamp", "off"),
+            "Desk lamp turned off.",
+        )
 
 
 class CommandLineTests(unittest.TestCase):

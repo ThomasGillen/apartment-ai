@@ -24,6 +24,8 @@ Python allow-list validation
 Jetson GPIO physical pin 7
     ↓
 LED standing in for desk_lamp
+    ↓
+Piper confirmation → Linux system audio → speaker
 ```
 
 The LLM never accesses GPIO directly. Voice and typed commands both enter the
@@ -37,6 +39,7 @@ same validation and output path.
 | Qwen3-4B | Downloaded automatically on first server launch | Loaded from the local cache |
 | `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
+| Piper | Install `piper-tts` and download one voice | Speaks fixed ready/action responses on CPU |
 | Python project | Create `.venv` and install requirements | Run push-to-talk or wake-listen mode |
 
 After setup, normal operation still uses only two terminals: one for
@@ -47,6 +50,7 @@ own server or terminal.
 
 - NVIDIA Jetson Orin Nano with JetPack and the CUDA toolkit installed
 - USB microphone or another ALSA-compatible capture device
+- USB, HDMI, or another ALSA-compatible speaker
 - Breadboard LED
 - 220–1000 Ω current-limiting resistor
 - Jumper wires
@@ -92,6 +96,8 @@ sudo apt install -y \
   curl \
   git \
   libssl-dev \
+  pipewire-bin \
+  pulseaudio-utils \
   python3-pip \
   python3-venv
 ```
@@ -111,8 +117,9 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The requirements install `requests` and NVIDIA's `Jetson.GPIO` Python package.
-This installation happens once, not each time the controller starts.
+The requirements install `requests`, NVIDIA's `Jetson.GPIO` package, and the
+local Piper text-to-speech package. This installation happens once, not each
+time the controller starts.
 
 ### 4. Configure GPIO permissions
 
@@ -272,7 +279,43 @@ aplay mic-test.wav
 
 Replace `2,0` with the card and device numbers reported by `arecord -l`.
 
-### 10. Run the software tests
+### 10. Download a Piper voice and test the speaker
+
+The default speech model is the English `en_US-lessac-medium` voice:
+
+```bash
+cd ~/apartment-ai
+source .venv/bin/activate
+mkdir -p voices
+python -m piper.download_voices \
+  --data-dir voices \
+  en_US-lessac-medium
+```
+
+This creates the two files expected by the controller:
+
+```text
+~/apartment-ai/voices/en_US-lessac-medium.onnx
+~/apartment-ai/voices/en_US-lessac-medium.onnx.json
+```
+
+Generate and play a test response:
+
+```bash
+python -m piper \
+  --data-dir voices \
+  --model en_US-lessac-medium \
+  -f tts-test.wav \
+  -- "Ready."
+
+paplay tts-test.wav
+```
+
+`paplay` follows Linux's selected system output, including a Bluetooth speaker.
+If it is unavailable, try `pw-play tts-test.wav`. Direct ALSA playback with
+`aplay` does not normally route to a Bluetooth sink managed by the desktop.
+
+### 11. Run the software tests
 
 ```bash
 cd ~/apartment-ai
@@ -294,14 +337,19 @@ cd ~/llama.cpp
 
 ./build/bin/llama-server \
   -hf Qwen/Qwen3-4B-GGUF:Q4_K_M \
-  -ngl 99 \
-  -c 4096 \
+  -c 2048 \
+  -np 1 \
+  -b 128 \
+  -ub 128 \
   --host 127.0.0.1 \
   --port 8080
 ```
 
 Leave this terminal running. The first launch needs internet access while Qwen
-is downloaded; subsequent launches use the cached model.
+is downloaded; subsequent launches use the cached model. Do not add `-ngl 99`:
+current llama.cpp automatically chooses how many layers fit on the GPU, while a
+manual value disables that fitting. The controller needs only one server slot,
+and its short JSON commands do not need a large context or batch buffer.
 
 ### Terminal 2 option A: push-to-talk mode
 
@@ -347,26 +395,31 @@ server or terminal:
 ```bash
 cd ~/apartment-ai
 source .venv/bin/activate
-python apartment_controller.py --wake-listen
+python apartment_controller.py --wake-listen --speak
 ```
 
 The default wake word is `command`. Use it in two stages:
 
 1. Say “command.”
-2. Wait for the terminal bell and `Recording command... speak now.` message.
+2. Wait for the spoken “Ready” response and the `Recording command...` message.
 3. Say “turn on my desk lamp.”
 
 The microphone remains open through one `arecord` process. Python continuously
 buffers local audio while Whisper examines overlapping two-second windows. When
 the wake word is detected, old buffered audio is discarded and a fresh
-five-second command is recorded. Only that post-wake transcript enters the
-Qwen interpretation, validation, and GPIO path.
+five-second command is recorded. The microphone audio containing the spoken
+“Ready” response is discarded before recording begins. Only the post-wake
+command transcript enters the Qwen interpretation, validation, and GPIO path.
+
+After an allowed GPIO action succeeds, Piper says either “Desk lamp turned on”
+or “Desk lamp turned off.” These are fixed Python responses, not raw LLM output.
 
 Use a more distinctive wake phrase if `command` triggers too easily:
 
 ```bash
 python apartment_controller.py \
   --wake-listen \
+  --speak \
   --wake-word "hey apartment"
 ```
 
@@ -375,8 +428,23 @@ For a non-default microphone or a longer wake-detection window:
 ```bash
 python apartment_controller.py \
   --wake-listen \
+  --speak \
   --microphone plughw:2,0 \
   --wake-window-seconds 3
+```
+
+The controller automatically tries `paplay`, then `pw-play`, so the selected
+Linux system output is used for Bluetooth. It falls back to direct ALSA only if
+neither system player is available.
+
+To force a physical ALSA playback device instead:
+
+```bash
+python apartment_controller.py \
+  --wake-listen \
+  --speak \
+  --microphone plughw:2,0 \
+  --speaker-device plughw:3,0
 ```
 
 Wake-listen mode performs more Whisper inference than push-to-talk, so it keeps
@@ -417,6 +485,9 @@ python apartment_controller.py --help
 - `--wake-listen` (or `--always-listen`) enables continuous wake-word mode.
 - `--wake-word PHRASE` changes the default `command` wake phrase.
 - `--wake-window-seconds N` changes the wake-detection audio window.
+- `--speak` enables local Piper ready and action responses.
+- `--tts-model PATH` selects a different Piper ONNX voice model.
+- `--speaker-device plughw:CARD,DEVICE` forces a direct ALSA playback device.
 - `--microphone plughw:CARD,DEVICE` selects an ALSA capture device.
 - `--record-seconds N` changes the recording window.
 - `--language auto` enables Whisper language detection.
@@ -445,6 +516,38 @@ free -h
 swapon --show
 ```
 
+### `llama-server` loads and then prints `Killed`
+
+Linux most likely terminated the server because the Jetson exhausted shared
+RAM. Confirm that with:
+
+```bash
+free -h
+swapon --show
+sudo journalctl -k -b --no-pager | grep -Ei "oom|out of memory|killed process"
+```
+
+Use the daily-operation command documented above. In particular, remove
+`-ngl 99`, use one slot with `-np 1`, and keep the context and batch sizes at
+`-c 2048 -b 128 -ub 128`. Also stop browsers and other memory-heavy programs
+while testing.
+
+If the 4B model is still killed, use the smaller 1.7B Q4 model:
+
+```bash
+./build/bin/llama-server \
+  -hf ggml-org/Qwen3-1.7B-GGUF:Q4_K_M \
+  -c 2048 \
+  -np 1 \
+  -b 128 \
+  -ub 128 \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+The Python controller uses the same local HTTP endpoint, so it needs no changes
+when switching between these two models.
+
 ### `whisper.cpp executable not found`
 
 Confirm that this file exists:
@@ -467,6 +570,15 @@ Speak the wake phrase by itself and wait for the ready message before saying the
 apartment command. Try a distinctive phrase such as `hey apartment`, or increase
 `--wake-window-seconds` from 2 to 3. Push-to-talk mode remains available when
 continuous Whisper scanning uses too much GPU time.
+
+### Piper model is missing or no speech is heard
+
+Confirm that both `voices/en_US-lessac-medium.onnx` and its `.onnx.json`
+configuration exist. For a Bluetooth speaker selected in Linux, test the
+generated file with `paplay tts-test.wav`, then `pw-play tts-test.wav` if
+needed. Use `pactl list short sinks` or `wpctl status` to inspect system audio
+sinks; Bluetooth outputs often do not appear in `aplay -l`. Use
+`--speaker-device` only for a physical device that does appear in `aplay -l`.
 
 ### GPIO permission error
 
@@ -492,6 +604,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 - [Qwen3-4B GGUF model](https://huggingface.co/Qwen/Qwen3-4B-GGUF)
 - [whisper.cpp documentation](https://github.com/ggml-org/whisper.cpp)
 - [whisper.cpp model downloads](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md)
+- [Piper local text-to-speech](https://github.com/OHF-Voice/piper1-gpl)
 - [NVIDIA Jetson.GPIO setup](https://github.com/NVIDIA/jetson-gpio)
 - [NVIDIA JetPack 7.2.1 release information](https://developer.nvidia.com/embedded/jetpack/downloads)
 - [NVIDIA Jetson-IO documentation for Jetson Linux 39.2](https://docs.nvidia.com/jetson/archives/r39.2/DeveloperGuide/HR/ConfiguringTheJetsonExpansionHeaders.html)
@@ -501,7 +614,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 
 - Stop recording automatically when speech ends
 - Replace continuous Whisper scanning with a smaller dedicated wake-word model
-- Text-to-speech confirmation
+- Add optional conversational responses beyond fixed confirmations
 - Home Assistant integration
 - Smart plugs and multiple lights
 - Environmental and presence sensors
