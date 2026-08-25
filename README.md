@@ -1,82 +1,293 @@
 # Apartment AI
 
-A local apartment automation project running on an NVIDIA Jetson Orin Nano.
+A fully local apartment automation project for an NVIDIA Jetson Orin Nano. A
+microphone command is transcribed by `whisper.cpp`, interpreted by Qwen running
+through `llama.cpp`, validated by Python, and represented by a breadboard LED on
+Jetson GPIO.
 
-The current version uses a locally hosted LLM to interpret natural-language commands and convert them into structured device commands. The Jetson then uses its GPIO pins to control physical hardware.
+No microphone audio, transcript, or apartment command is sent to a cloud API.
+Internet access is only needed during initial package and model downloads.
 
-Currently, the project supports controlling a breadboard LED as a stand-in for a desk lamp.
-
-## Current Architecture
-
-```text
-User command
-    ↓
-Qwen3-4B
-running locally with llama.cpp
-    ↓
-JSON command
-    ↓
-Python validation
-    ↓
-Jetson GPIO
-    ↓
-LED / device
-```
-
-Example:
+## Architecture
 
 ```text
-Command: turn on my desk lamp
+USB microphone
+    ↓
+ALSA arecord → temporary 16 kHz mono WAV
+    ↓
+whisper.cpp → transcript
+    ↓
+Qwen3-4B on llama.cpp → JSON device command
+    ↓
+Python allow-list validation
+    ↓
+Jetson GPIO physical pin 7
+    ↓
+LED standing in for desk_lamp
 ```
 
-LLM output:
+The LLM never accesses GPIO directly. Voice and typed commands both enter the
+same validation and output path.
 
-```json
-{
-  "device": "desk_lamp",
-  "action": "on"
-}
-```
+## One-time setup versus daily use
 
-The Python controller validates the command and sets the corresponding Jetson GPIO output HIGH or LOW.
+| Component | One-time setup | Normal use |
+| --- | --- | --- |
+| `llama.cpp` | Build `llama-server` with CUDA | Keep one server process running |
+| Qwen3-4B | Downloaded automatically on first server launch | Loaded from the local cache |
+| `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for each recording |
+| Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
+| Python project | Create `.venv` and install requirements | Run `apartment_controller.py --voice` |
+
+After setup, normal operation still uses only two terminals: one for
+`llama-server` and one for the apartment controller. Whisper does not need its
+own server or terminal.
 
 ## Hardware
 
-Current hardware:
-
-- NVIDIA Jetson Orin Nano
-- JetPack 7.2.1
-- Breadboard
-- LED
-- Current-limiting resistor
+- NVIDIA Jetson Orin Nano with JetPack and the CUDA toolkit installed
+- USB microphone or another ALSA-compatible capture device
+- Breadboard LED
+- 220–1000 Ω current-limiting resistor
 - Jumper wires
 
-Current GPIO configuration:
+Current physical wiring:
 
-- Jetson physical pin 7 — GPIO output
-- Jetson physical pin 6 — GND
+- Jetson physical pin 7 — GPIO output for the LED
+- Jetson physical pin 6 — ground
 
-Pin 7 must first be configured as GPIO using NVIDIA's Jetson-IO utility.
+Wire the resistor in series with the LED. The LED anode connects toward pin 7
+and the cathode connects toward ground. Power down the Jetson before changing
+the wiring.
 
-## Software
+## Full one-time setup
 
-The project currently uses:
+Run the following sections on the Jetson, not on a separate Windows computer.
+The commands assume this project is at `~/apartment-ai`, `llama.cpp` will be at
+`~/llama.cpp`, and `whisper.cpp` will be at `~/whisper.cpp`. The documented
+Jetson environment is JetPack 7.2.1 with Jetson Linux 39.2.1 and CUDA 13.2.1.
 
-- `llama.cpp`
-- Qwen3-4B GGUF (`Q4_K_M`)
-- Python
-- `requests`
-- `Jetson.GPIO`
+### 1. Confirm JetPack and CUDA
 
-The LLM runs entirely locally on the Jetson.
+JetPack should already be installed. Confirm that the Jetson is ARM64 and that
+the CUDA compiler is available:
 
-## Running the Project
+```bash
+uname -m
+nvcc --version
+python3 --version
+```
 
-Two terminals are required.
+`uname -m` should report `aarch64`. If `nvcc` is missing, repair the JetPack/CUDA
+installation before building either local AI project.
 
-### 1. Start the LLM Server
+### 2. Install system packages
 
-From the `llama.cpp` directory:
+```bash
+sudo apt update
+sudo apt install -y \
+  alsa-utils \
+  build-essential \
+  cmake \
+  curl \
+  git \
+  libssl-dev \
+  python3-pip \
+  python3-venv
+```
+
+These provide the C/C++ build tools, Python environment support, ALSA microphone
+tools, and HTTPS support for downloading the Qwen model.
+
+### 3. Create the Python environment
+
+Place or clone this repository at `~/apartment-ai`, then run:
+
+```bash
+cd ~/apartment-ai
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The requirements install `requests` and NVIDIA's `Jetson.GPIO` Python package.
+This installation happens once, not each time the controller starts.
+
+### 4. Configure GPIO permissions
+
+With the project environment still active:
+
+```bash
+sudo groupadd -f -r gpio
+sudo usermod -a -G gpio "$USER"
+
+GPIO_RULE_PATH="$(python -c 'from pathlib import Path; import Jetson.GPIO as GPIO; print(Path(GPIO.__file__).with_name("99-gpio.rules"))')"
+sudo cp "$GPIO_RULE_PATH" /etc/udev/rules.d/99-gpio.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+This permits GPIO access without running the entire controller as root.
+
+### 5. Configure physical pin 7 with Jetson-IO
+
+Launch NVIDIA's header configuration tool:
+
+```bash
+sudo /opt/nvidia/jetson-io/jetson-io.py
+```
+
+In the interface:
+
+1. Select the 40-pin header.
+2. Choose the option to configure header pins manually.
+3. Ensure physical pin 7 is configured as GPIO.
+4. Save the pin changes and reboot.
+
+The reboot also activates the new `gpio` group membership. After reconnecting,
+confirm it with:
+
+```bash
+groups
+```
+
+The output should include `gpio`.
+
+### 6. Test the LED and GPIO
+
+```bash
+cd ~/apartment-ai
+source .venv/bin/activate
+python gpio_test.py
+```
+
+The LED should alternate on and off every two seconds. Press Ctrl+C to stop; the
+cleanup code leaves the LED off.
+
+### 7. Build llama.cpp for Qwen
+
+`llama.cpp` is the local LLM runtime. It builds the HTTP server that the Python
+controller calls.
+
+```bash
+cd ~
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+
+cmake -S . -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=87 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_OPENSSL=ON
+
+cmake --build build \
+  --config Release \
+  --target llama-server \
+  --parallel 1
+```
+
+If `~/llama.cpp` already exists, skip the `git clone` line, enter that directory,
+and rerun the `cmake` commands. Completed build work will be reused.
+
+The expected executable is:
+
+```text
+~/llama.cpp/build/bin/llama-server
+```
+
+Architecture `87` targets the Jetson Orin GPU. The single build job is
+intentional: parallel CUDA compilation can exhaust the Jetson's shared memory.
+
+The Qwen model does not require a separate manual download command. The first
+server launch with `-hf Qwen/Qwen3-4B-GGUF:Q4_K_M` downloads and caches the
+Q4_K_M model. Later launches use the local cached copy.
+
+### 8. Build whisper.cpp for speech-to-text
+
+`whisper.cpp` is separate from `llama.cpp`. It builds the command-line program
+that converts recorded audio into text.
+
+```bash
+cd ~
+git clone https://github.com/ggml-org/whisper.cpp.git
+cd whisper.cpp
+
+cmake -S . -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=87 \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build build \
+  --config Release \
+  --target whisper-cli \
+  --parallel 1
+
+sh ./models/download-ggml-model.sh base.en
+```
+
+If `~/whisper.cpp` already exists, skip the `git clone` line, enter that
+directory, and rerun the configure, single-job build, and model-download
+commands.
+
+The controller's default voice paths are:
+
+```text
+~/whisper.cpp/build/bin/whisper-cli
+~/whisper.cpp/models/ggml-base.en.bin
+```
+
+Test the build with the sample included in `whisper.cpp`:
+
+```bash
+./build/bin/whisper-cli \
+  --model models/ggml-base.en.bin \
+  --file samples/jfk.wav \
+  --no-timestamps
+```
+
+A successful run prints an English transcription.
+
+### 9. Check the microphone
+
+List available capture devices:
+
+```bash
+arecord -l
+```
+
+First try the default microphone:
+
+```bash
+arecord -f S16_LE -r 16000 -c 1 -d 5 mic-test.wav
+aplay mic-test.wav
+```
+
+If the USB microphone is listed as card 2, device 0, select it explicitly:
+
+```bash
+arecord -D plughw:2,0 -f S16_LE -r 16000 -c 1 -d 5 mic-test.wav
+aplay mic-test.wav
+```
+
+Replace `2,0` with the card and device numbers reported by `arecord -l`.
+
+### 10. Run the software tests
+
+```bash
+cd ~/apartment-ai
+source .venv/bin/activate
+python -m unittest -v
+```
+
+These tests simulate the voice and LLM boundaries. They do not record from the
+real microphone or change GPIO.
+
+## Daily operation
+
+Only two terminals are needed after the one-time setup.
+
+### Terminal 1: start the local LLM server
 
 ```bash
 cd ~/llama.cpp
@@ -89,141 +300,154 @@ cd ~/llama.cpp
   --port 8080
 ```
 
-This starts the Qwen model locally and exposes the llama.cpp API at:
+Leave this terminal running. The first launch needs internet access while Qwen
+is downloaded; subsequent launches use the cached model.
 
-```text
-http://127.0.0.1:8080
-```
+### Terminal 2: start the apartment controller
 
-Leave this terminal running.
-
-### 2. Activate the Python Environment
-
-Open another terminal:
+For the default microphone:
 
 ```bash
 cd ~/apartment-ai
 source .venv/bin/activate
+python apartment_controller.py --voice
 ```
 
-The terminal should now show the virtual environment as active:
+The prompt shows:
 
 ```text
-(.venv)
+Press Enter to speak, type a command, or type 'quit':
 ```
 
-### 3. Start the Apartment Controller
+Press Enter, then say a short command such as “turn on my desk lamp.” The
+controller records for five seconds, transcribes the audio locally, displays
+what it heard, sends the transcript to Qwen, validates Qwen's JSON response, and
+changes the LED only if the command is allowed.
 
-Run:
+For a non-default microphone:
 
 ```bash
+python apartment_controller.py --voice --microphone plughw:2,0
+```
+
+To use a seven-second recording window:
+
+```bash
+python apartment_controller.py --voice --record-seconds 7
+```
+
+Typing text at the voice prompt bypasses recording for that command. Type
+`exit` or `quit`, or press Ctrl+C, to stop. The cleanup path leaves the LED off.
+
+### Text-only mode
+
+The original text input remains available:
+
+```bash
+cd ~/apartment-ai
+source .venv/bin/activate
 python apartment_controller.py
 ```
 
-The program will display:
+## Command safety
+
+The only allowed device/action pairs are:
 
 ```text
-Command:
+desk_lamp → on
+desk_lamp → off
+none      → none
 ```
 
-Enter a command such as:
+Malformed JSON, unknown devices, invalid actions, microphone failures,
+transcription failures, and LLM connection errors are rejected without changing
+GPIO. The LED is also forced off during normal controller shutdown.
 
-```text
-turn on my desk lamp
+## Useful options
+
+```bash
+python apartment_controller.py --help
 ```
 
-or:
+- `--voice` enables push-to-talk input.
+- `--microphone plughw:CARD,DEVICE` selects an ALSA capture device.
+- `--record-seconds N` changes the recording window.
+- `--language auto` enables Whisper language detection.
+- `--whisper-bin PATH` selects a different `whisper-cli` executable.
+- `--whisper-model PATH` selects a different Whisper model.
+- `--llm-url URL` selects a different chat-completions endpoint.
+- `--led-pin N` changes the physical BOARD pin used for the LED.
 
-```text
-turn off the desk light
+## Troubleshooting
+
+### Build ends with `Killed` or `Error 137`
+
+The Jetson ran out of memory during compilation. Stop `llama-server` and other
+large applications, then rerun the relevant configure command and build with:
+
+```bash
+cmake --build build --config Release --parallel 1
 ```
 
-The LLM interprets the request and returns JSON. The Python controller validates the response before changing the GPIO state.
+CMake reuses completed object files; deleting or cloning the repository again is
+normally unnecessary. If a single-job build still fails, inspect memory and
+swap with:
 
-Type:
-
-```text
-exit
+```bash
+free -h
+swapon --show
 ```
 
-or:
+### `whisper.cpp executable not found`
 
-```text
-quit
+Confirm that this file exists:
+
+```bash
+ls -l ~/whisper.cpp/build/bin/whisper-cli
 ```
 
-to stop the controller.
+If `whisper.cpp` is installed elsewhere, supply `--whisper-bin` and
+`--whisper-model` explicitly.
 
-## Command Safety
+### `arecord` cannot find the microphone
 
-The LLM does not directly control GPIO.
+Run `arecord -l`, test the device with a short recording, and pass its
+`plughw:CARD,DEVICE` value through `--microphone`.
 
-Its response is first parsed and checked against a list of allowed devices and actions.
+### GPIO permission error
 
-Currently allowed:
+Run `groups` and confirm that `gpio` is present. If it is missing after running
+the permission commands, reboot the Jetson. Also confirm that
+`/etc/udev/rules.d/99-gpio.rules` exists.
 
-```text
-desk_lamp
-  ├── on
-  └── off
+### Controller cannot reach the LLM
+
+Make sure Terminal 1 is still running. From another terminal, check:
+
+```bash
+curl http://127.0.0.1:8080/health
 ```
 
-Unrelated prompts can return:
+The controller expects the OpenAI-compatible chat-completions endpoint at
+`http://127.0.0.1:8080/v1/chat/completions`.
 
-```json
-{
-  "device": "none",
-  "action": "none"
-}
-```
+## Upstream references
 
-Only validated commands reach the GPIO control code.
+- [llama.cpp CUDA build documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+- [llama-server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+- [Qwen3-4B GGUF model](https://huggingface.co/Qwen/Qwen3-4B-GGUF)
+- [whisper.cpp documentation](https://github.com/ggml-org/whisper.cpp)
+- [whisper.cpp model downloads](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md)
+- [NVIDIA Jetson.GPIO setup](https://github.com/NVIDIA/jetson-gpio)
+- [NVIDIA JetPack 7.2.1 release information](https://developer.nvidia.com/embedded/jetpack/downloads)
+- [NVIDIA Jetson-IO documentation for Jetson Linux 39.2](https://docs.nvidia.com/jetson/archives/r39.2/DeveloperGuide/HR/ConfiguringTheJetsonExpansionHeaders.html)
+- [NVIDIA CUDA compute capabilities](https://developer.nvidia.com/cuda/gpus)
 
-## Current Status
+## Next milestones
 
-Working:
-
-- Local Qwen3-4B inference on Jetson
-- CUDA-accelerated inference through llama.cpp
-- Local llama.cpp API server
-- Python-to-LLM communication
-- Natural-language command interpretation
-- JSON command output
-- Command validation
-- Jetson GPIO control
-- Physical LED on/off control
-
-## Planned Expansion
-
-Possible next steps include:
-
-```text
-Text input
-    ↓
-Voice input
-    ↓
-Speech-to-text
-    ↓
-Local LLM
-    ↓
-Apartment controller
-    ↓
-Home Assistant
-    ↓
-Smart plugs / lights / sensors
-```
-
-Future features may include:
-
-- Local microphone input
-- Local speech-to-text
-- Text-to-speech responses
+- Stop recording automatically when speech ends
+- Optional wake word and always-listening mode
+- Text-to-speech confirmation
 - Home Assistant integration
-- Smart plug control for normal wall-powered lamps
-- Multiple rooms and devices
-- Environmental sensors
-- Presence detection
-- Automated lighting
-- ROS 2 integration for more complex distributed hardware
-- ESP32/STM32 remote nodes
-- Computer vision using the Jetson
+- Smart plugs and multiple lights
+- Environmental and presence sensors

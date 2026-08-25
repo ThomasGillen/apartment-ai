@@ -1,0 +1,2 @@
+requests>=2.31,<3
+Jetson.GPIO>=2.1,<3
