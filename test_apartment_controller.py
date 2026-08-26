@@ -12,8 +12,13 @@ from apartment_controller import (
     PiperSpeechOutput,
     WakeWordInput,
     WhisperVoiceInput,
+    get_alsa_microphones,
+    get_system_audio_sinks,
     interpret_command,
+    main,
     parse_args,
+    resolve_microphone,
+    resolve_system_sink,
     validate_command,
 )
 
@@ -257,6 +262,47 @@ class SpeechOutputTests(unittest.TestCase):
             self.assertEqual(Path(play_command[-1]).name, "response.wav")
 
     @patch("apartment_controller.shutil.which")
+    def test_routes_to_manually_selected_friendly_system_speaker(self, which):
+        which.side_effect = lambda player: (
+            "/usr/bin/paplay" if player == "paplay" else None
+        )
+        sinks = [
+            {
+                "index": "52",
+                "name": "bluez_output.11_22_33.a2dp-sink",
+                "description": "Living Room Speaker",
+                "state": "RUNNING",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "voice.onnx"
+            model_path.write_bytes(b"model")
+            Path(f"{model_path}.json").write_text("{}", encoding="utf-8")
+            voice = Mock()
+            voice.synthesize_wav.side_effect = self._write_test_audio
+            player_runner = Mock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            speech_output = PiperSpeechOutput(
+                model_path=model_path,
+                playback_sink="living room",
+                sink_lister=Mock(return_value=sinks),
+                voice_loader=Mock(return_value=voice),
+                player_runner=player_runner,
+            )
+
+            speech_output.speak("Ready.")
+
+            play_command = player_runner.call_args.args[0]
+            self.assertEqual(play_command[0], "paplay")
+            self.assertIn(
+                "--device=bluez_output.11_22_33.a2dp-sink",
+                play_command,
+            )
+            self.assertEqual(speech_output.speaker_label, "Living Room Speaker")
+
+    @patch("apartment_controller.shutil.which")
     def test_falls_back_when_first_system_player_fails(self, which):
         available = {
             "paplay": "/usr/bin/paplay",
@@ -289,6 +335,118 @@ class SpeechOutputTests(unittest.TestCase):
             self.assertEqual(player_runner.call_args_list[1].args[0][0], "pw-play")
 
 
+class SystemAudioSinkTests(unittest.TestCase):
+    @patch("apartment_controller.shutil.which", return_value="/usr/bin/pactl")
+    def test_reads_system_speakers_from_pactl_json(self, _which):
+        pactl_output = json.dumps(
+            [
+                {
+                    "index": 7,
+                    "name": "alsa_output.usb-AB13X",
+                    "description": "AB13X USB Audio",
+                    "state": "SUSPENDED",
+                },
+                {
+                    "index": 9,
+                    "name": "bluez_output.11_22_33.a2dp-sink",
+                    "description": "Living Room Speaker",
+                    "state": "RUNNING",
+                },
+            ]
+        )
+        runner = Mock(
+            return_value=subprocess.CompletedProcess([], 0, pactl_output, "")
+        )
+
+        sinks = get_system_audio_sinks(command_runner=runner)
+
+        self.assertEqual(len(sinks), 2)
+        self.assertEqual(sinks[0]["description"], "AB13X USB Audio")
+        self.assertEqual(sinks[1]["index"], "9")
+
+    def test_resolves_sink_by_index_description_or_unique_partial_name(self):
+        sinks = [
+            {
+                "index": "7",
+                "name": "alsa_output.usb-AB13X",
+                "description": "AB13X USB Audio",
+            },
+            {
+                "index": "9",
+                "name": "bluez_output.11_22_33.a2dp-sink",
+                "description": "Living Room Speaker",
+            },
+        ]
+
+        self.assertEqual(resolve_system_sink("7", sinks), sinks[0])
+        self.assertEqual(
+            resolve_system_sink("Living Room Speaker", sinks),
+            sinks[1],
+        )
+        self.assertEqual(resolve_system_sink("bluez_output", sinks), sinks[1])
+
+    def test_rejects_unknown_speaker_with_listing_hint(self):
+        with self.assertRaisesRegex(ControllerError, "--list-speakers"):
+            resolve_system_sink("Kitchen", [])
+
+
+class MicrophoneSelectionTests(unittest.TestCase):
+    @patch("apartment_controller.shutil.which", return_value="/usr/bin/arecord")
+    def test_reads_stable_microphone_selectors_from_arecord(self, _which):
+        arecord_output = """\
+**** List of CAPTURE Hardware Devices ****
+card 0: Microphone [onn USB Microphone], device 0: USB Audio [USB Audio]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 2: Webcam [Conference Webcam], device 1: USB Audio [USB Audio]
+  Subdevices: 1/1
+"""
+        runner = Mock(
+            return_value=subprocess.CompletedProcess([], 0, arecord_output, "")
+        )
+
+        microphones = get_alsa_microphones(command_runner=runner)
+
+        self.assertEqual(len(microphones), 2)
+        self.assertEqual(
+            microphones[0]["selector"],
+            "plughw:CARD=Microphone,DEV=0",
+        )
+        self.assertEqual(microphones[1]["card_description"], "Conference Webcam")
+
+    def test_resolves_friendly_microphone_to_stable_alsa_selector(self):
+        microphones = [
+            {
+                "card_index": "0",
+                "card_id": "Microphone",
+                "card_description": "onn USB Microphone",
+                "device_index": "0",
+                "device_name": "USB Audio",
+                "device_description": "USB Audio",
+                "selector": "plughw:CARD=Microphone,DEV=0",
+            }
+        ]
+
+        self.assertEqual(
+            resolve_microphone("onn USB", microphones),
+            "plughw:CARD=Microphone,DEV=0",
+        )
+        self.assertEqual(
+            resolve_microphone("0", microphones),
+            "plughw:CARD=Microphone,DEV=0",
+        )
+
+    def test_preserves_existing_direct_alsa_microphone_selector(self):
+        self.assertEqual(
+            resolve_microphone("plughw:2,0"),
+            "plughw:2,0",
+        )
+
+    def test_rejects_unknown_microphone_with_listing_hint(self):
+        with self.assertRaisesRegex(ControllerError, "--list-microphones"):
+            resolve_microphone("Kitchen", [])
+
+
 class GpioLedTests(unittest.TestCase):
     def test_returns_fixed_spoken_confirmation_after_action(self):
         led = GpioLed.__new__(GpioLed)
@@ -306,12 +464,43 @@ class GpioLedTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
-    def test_always_listen_alias_enables_wake_mode(self):
-        args = parse_args(["--always-listen", "--wake-word", "hey apartment"])
+    def test_listen_enables_continuous_mode(self):
+        args = parse_args(["--listen", "--wake-word", "hey apartment"])
 
-        self.assertTrue(args.wake_listen)
+        self.assertTrue(args.listen)
         self.assertFalse(args.voice)
         self.assertEqual(args.wake_word, "hey apartment")
+
+    def test_voice_and_listen_modes_are_mutually_exclusive(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            parse_args(["--voice", "--listen"])
+
+    def test_accepts_friendly_system_speaker_with_speech_enabled(self):
+        args = parse_args(["--speak", "--speaker", "Living Room Speaker"])
+
+        self.assertEqual(args.speaker, "Living Room Speaker")
+        self.assertIsNone(args.speaker_device)
+
+    @patch("apartment_controller.print_available_speakers")
+    def test_speaker_listing_exits_before_hardware_initialization(self, listing):
+        self.assertEqual(main(["--list-speakers"]), 0)
+        listing.assert_called_once_with()
+
+    @patch("apartment_controller.print_available_microphones")
+    def test_microphone_listing_exits_before_hardware_initialization(self, listing):
+        self.assertEqual(main(["--list-microphones"]), 0)
+        listing.assert_called_once_with()
+
+    @patch("apartment_controller.print_available_microphones")
+    @patch("apartment_controller.print_available_speakers")
+    def test_combined_audio_listing_exits_before_hardware_initialization(
+        self,
+        speakers,
+        microphones,
+    ):
+        self.assertEqual(main(["--list-audio"]), 0)
+        speakers.assert_called_once_with()
+        microphones.assert_called_once_with()
 
 
 if __name__ == "__main__":

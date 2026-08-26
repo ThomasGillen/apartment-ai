@@ -17,7 +17,7 @@ ALSA arecord → temporary 16 kHz mono WAV
     ↓
 whisper.cpp → transcript
     ↓
-Qwen3-4B on llama.cpp → JSON device command
+Qwen3-1.7B on llama.cpp → JSON device command
     ↓
 Python allow-list validation
     ↓
@@ -36,11 +36,11 @@ same validation and output path.
 | Component | One-time setup | Normal use |
 | --- | --- | --- |
 | `llama.cpp` | Build `llama-server` with CUDA | Keep one server process running |
-| Qwen3-4B | Downloaded automatically on first server launch | Loaded from the local cache |
+| Qwen3-1.7B | Downloaded automatically on first server launch | Loaded from the local cache |
 | `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
 | Piper | Install `piper-tts` and download one voice | Speaks fixed ready/action responses on CPU |
-| Python project | Create `.venv` and install requirements | Run push-to-talk or wake-listen mode |
+| Python project | Create `.venv` and install requirements | Run push-to-talk or continuous listen mode |
 
 After setup, normal operation still uses only two terminals: one for
 `llama-server` and one for the apartment controller. Whisper does not need its
@@ -207,8 +207,10 @@ Architecture `87` targets the Jetson Orin GPU. The single build job is
 intentional: parallel CUDA compilation can exhaust the Jetson's shared memory.
 
 The Qwen model does not require a separate manual download command. The first
-server launch with `-hf Qwen/Qwen3-4B-GGUF:Q4_K_M` downloads and caches the
-Q4_K_M model. Later launches use the local cached copy.
+server launch with `-hf ggml-org/Qwen3-1.7B-GGUF:Q4_K_M` downloads and caches
+the Q4_K_M model. Later launches use the local cached copy. The 1.7B model is
+the default because it leaves more shared-memory and power headroom for
+continuous Whisper transcription and the desktop audio services.
 
 ### 8. Build whisper.cpp for speech-to-text
 
@@ -261,23 +263,37 @@ List available capture devices:
 
 ```bash
 arecord -l
+python apartment_controller.py --list-microphones
 ```
+
+The controller listing shows both a friendly description and a stable selector
+based on the ALSA card name. Unlike a numeric card position, the named selector
+normally remains unchanged after a reboot.
 
 First try the default microphone:
 
 ```bash
 arecord -f S16_LE -r 16000 -c 1 -d 5 mic-test.wav
-aplay mic-test.wav
+paplay mic-test.wav
 ```
 
-If the USB microphone is listed as card 2, device 0, select it explicitly:
+If the controller lists `onn USB Microphone`, test it by friendly name or with
+the stable input it displays:
 
 ```bash
-arecord -D plughw:2,0 -f S16_LE -r 16000 -c 1 -d 5 mic-test.wav
-aplay mic-test.wav
+arecord \
+  -D 'plughw:CARD=Microphone,DEV=0' \
+  -f S16_LE \
+  -r 16000 \
+  -c 1 \
+  -d 5 \
+  mic-test.wav
+
+paplay mic-test.wav
 ```
 
-Replace `2,0` with the card and device numbers reported by `arecord -l`.
+Replace the example selector with the `input:` value printed by
+`--list-microphones`.
 
 ### 10. Download a Piper voice and test the speaker
 
@@ -315,6 +331,22 @@ paplay tts-test.wav
 If it is unavailable, try `pw-play tts-test.wav`. Direct ALSA playback with
 `aplay` does not normally route to a Bluetooth sink managed by the desktop.
 
+List the friendly names and exact sink IDs for every wired and Bluetooth
+speaker currently visible to Linux:
+
+```bash
+python apartment_controller.py --list-speakers
+```
+
+This listing exits without loading Piper, Whisper, the LLM, or GPIO, so it can
+also be run remotely over SSH.
+
+To list both microphone inputs and speaker outputs in one remote command:
+
+```bash
+python apartment_controller.py --list-audio
+```
+
 ### 11. Run the software tests
 
 ```bash
@@ -336,11 +368,11 @@ Only two terminals are needed after the one-time setup.
 cd ~/llama.cpp
 
 ./build/bin/llama-server \
-  -hf Qwen/Qwen3-4B-GGUF:Q4_K_M \
-  -c 2048 \
+  -hf ggml-org/Qwen3-1.7B-GGUF:Q4_K_M \
+  -c 1024 \
   -np 1 \
-  -b 128 \
-  -ub 128 \
+  -b 64 \
+  -ub 64 \
   --host 127.0.0.1 \
   --port 8080
 ```
@@ -375,8 +407,13 @@ changes the LED only if the command is allowed.
 For a non-default microphone:
 
 ```bash
-python apartment_controller.py --voice --microphone plughw:2,0
+python apartment_controller.py \
+  --voice \
+  --microphone "onn USB Microphone"
 ```
+
+The friendly name is resolved to a stable `plughw:CARD=...,DEV=...` selector at
+startup. Existing numeric selectors such as `plughw:2,0` remain supported.
 
 To use a seven-second recording window:
 
@@ -387,7 +424,7 @@ python apartment_controller.py --voice --record-seconds 7
 Typing text at the voice prompt bypasses recording for that command. Type
 `exit` or `quit`, or press Ctrl+C, to stop. The cleanup path leaves the LED off.
 
-### Terminal 2 option B: continuous wake-word mode
+### Terminal 2 option B: continuous listen mode
 
 The continuous mode uses the same build and model; it needs no additional
 server or terminal:
@@ -395,7 +432,7 @@ server or terminal:
 ```bash
 cd ~/apartment-ai
 source .venv/bin/activate
-python apartment_controller.py --wake-listen --speak
+python apartment_controller.py --listen --speak
 ```
 
 The default wake word is `command`. Use it in two stages:
@@ -418,7 +455,7 @@ Use a more distinctive wake phrase if `command` triggers too easily:
 
 ```bash
 python apartment_controller.py \
-  --wake-listen \
+  --listen \
   --speak \
   --wake-word "hey apartment"
 ```
@@ -427,9 +464,9 @@ For a non-default microphone or a longer wake-detection window:
 
 ```bash
 python apartment_controller.py \
-  --wake-listen \
+  --listen \
   --speak \
-  --microphone plughw:2,0 \
+  --microphone "onn USB Microphone" \
   --wake-window-seconds 3
 ```
 
@@ -437,18 +474,55 @@ The controller automatically tries `paplay`, then `pw-play`, so the selected
 Linux system output is used for Bluetooth. It falls back to direct ALSA only if
 neither system player is available.
 
-To force a physical ALSA playback device instead:
+To select a particular wired or Bluetooth speaker without changing the Linux
+desktop default, first list the available choices:
+
+```bash
+python apartment_controller.py --list-speakers
+```
+
+Then use either its friendly description:
 
 ```bash
 python apartment_controller.py \
-  --wake-listen \
+  --listen \
   --speak \
-  --microphone plughw:2,0 \
+  --microphone "onn USB Microphone" \
+  --speaker "AB13X USB Audio"
+```
+
+Or use the exact sink ID shown by the listing, which is useful when two
+speakers have similar names:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --microphone "onn USB Microphone" \
+  --speaker "bluez_output.XX_XX_XX_XX_XX_XX.1"
+```
+
+`--speaker` keeps playback inside Linux system audio, so it supports Bluetooth,
+resampling, and device sharing. It works from an SSH terminal as long as that
+user's Linux audio session is running.
+
+For a headless system with no PulseAudio/PipeWire session, the advanced direct
+ALSA option remains available:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --microphone "onn USB Microphone" \
   --speaker-device plughw:3,0
 ```
 
-Wake-listen mode performs more Whisper inference than push-to-talk, so it keeps
-the Jetson busier. All audio and temporary transcripts remain local and are
+Direct ALSA bypasses Linux system audio and can report `Device or resource busy`
+when the desktop audio service already owns the hardware. Prefer `--speaker`
+whenever the desired output appears in `--list-speakers`.
+
+Listen mode performs more Whisper inference than push-to-talk, so it keeps the
+Jetson busier. All audio and temporary transcripts remain local and are
 deleted after each check. Press Ctrl+C to stop.
 
 ### Text-only mode
@@ -482,13 +556,17 @@ python apartment_controller.py --help
 ```
 
 - `--voice` enables push-to-talk input.
-- `--wake-listen` (or `--always-listen`) enables continuous wake-word mode.
+- `--listen` enables continuous listen mode with wake-word detection.
 - `--wake-word PHRASE` changes the default `command` wake phrase.
 - `--wake-window-seconds N` changes the wake-detection audio window.
 - `--speak` enables local Piper ready and action responses.
 - `--tts-model PATH` selects a different Piper ONNX voice model.
+- `--list-speakers` lists wired and Bluetooth system-audio outputs, then exits.
+- `--speaker NAME` selects a system speaker by description, sink ID, or index.
 - `--speaker-device plughw:CARD,DEVICE` forces a direct ALSA playback device.
-- `--microphone plughw:CARD,DEVICE` selects an ALSA capture device.
+- `--list-microphones` (or `--list-inputs`) lists friendly ALSA inputs, then exits.
+- `--list-audio` lists microphone inputs and speaker outputs together, then exits.
+- `--microphone NAME` selects an input by description or stable ALSA selector.
 - `--record-seconds N` changes the recording window.
 - `--language auto` enables Whisper language detection.
 - `--whisper-bin PATH` selects a different `whisper-cli` executable.
@@ -529,24 +607,25 @@ sudo journalctl -k -b --no-pager | grep -Ei "oom|out of memory|killed process"
 
 Use the daily-operation command documented above. In particular, remove
 `-ngl 99`, use one slot with `-np 1`, and keep the context and batch sizes at
-`-c 2048 -b 128 -ub 128`. Also stop browsers and other memory-heavy programs
+`-c 1024 -b 64 -ub 64`. Also stop browsers and other memory-heavy programs
 while testing.
 
-If the 4B model is still killed, use the smaller 1.7B Q4 model:
+The documented 1.7B Q4 model is the stable baseline. If you experiment with a
+larger model and the server is killed, return to this command:
 
 ```bash
 ./build/bin/llama-server \
   -hf ggml-org/Qwen3-1.7B-GGUF:Q4_K_M \
-  -c 2048 \
+  -c 1024 \
   -np 1 \
-  -b 128 \
-  -ub 128 \
+  -b 64 \
+  -ub 64 \
   --host 127.0.0.1 \
   --port 8080
 ```
 
-The Python controller uses the same local HTTP endpoint, so it needs no changes
-when switching between these two models.
+The Python controller uses the same local HTTP endpoint, so switching models
+does not require a controller change.
 
 ### `whisper.cpp executable not found`
 
@@ -561,8 +640,10 @@ If `whisper.cpp` is installed elsewhere, supply `--whisper-bin` and
 
 ### `arecord` cannot find the microphone
 
-Run `arecord -l`, test the device with a short recording, and pass its
-`plughw:CARD,DEVICE` value through `--microphone`.
+Run `python apartment_controller.py --list-microphones`. Select the microphone
+by its friendly description, or copy its stable `plughw:CARD=...,DEV=...`
+input. If nothing is listed, run `arecord -l`, reconnect the USB microphone,
+and try another USB port.
 
 ### Wake word is missed or triggers accidentally
 
@@ -574,11 +655,11 @@ continuous Whisper scanning uses too much GPU time.
 ### Piper model is missing or no speech is heard
 
 Confirm that both `voices/en_US-lessac-medium.onnx` and its `.onnx.json`
-configuration exist. For a Bluetooth speaker selected in Linux, test the
-generated file with `paplay tts-test.wav`, then `pw-play tts-test.wav` if
-needed. Use `pactl list short sinks` or `wpctl status` to inspect system audio
-sinks; Bluetooth outputs often do not appear in `aplay -l`. Use
-`--speaker-device` only for a physical device that does appear in `aplay -l`.
+configuration exist. Run `python apartment_controller.py --list-speakers`, then
+test the chosen sink with `--speaker`. For a Bluetooth speaker, also test the
+generated file with `paplay tts-test.wav`. Bluetooth outputs often do not appear
+in `aplay -l`; reserve `--speaker-device` for a headless direct-ALSA setup where
+Linux system audio is not already using the hardware.
 
 ### GPIO permission error
 
@@ -601,7 +682,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 
 - [llama.cpp CUDA build documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
 - [llama-server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
-- [Qwen3-4B GGUF model](https://huggingface.co/Qwen/Qwen3-4B-GGUF)
+- [Qwen3-1.7B GGUF model](https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF)
 - [whisper.cpp documentation](https://github.com/ggml-org/whisper.cpp)
 - [whisper.cpp model downloads](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md)
 - [Piper local text-to-speech](https://github.com/OHF-Voice/piper1-gpl)

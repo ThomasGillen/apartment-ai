@@ -338,6 +338,301 @@ class WhisperVoiceInput:
             raise ControllerError(error_prefix)
 
 
+def _run_audio_query(command, command_runner=None):
+    runner = command_runner or subprocess.run
+    try:
+        return runner(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def get_system_audio_sinks(command_runner=None):
+    """Return PulseAudio/PipeWire output sinks with friendly descriptions."""
+    if shutil.which("pactl") is None:
+        return []
+
+    result = _run_audio_query(
+        ["pactl", "--format=json", "list", "sinks"],
+        command_runner=command_runner,
+    )
+    if result is not None and result.returncode == 0:
+        try:
+            raw_sinks = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raw_sinks = None
+
+        if isinstance(raw_sinks, list):
+            sinks = []
+            for raw_sink in raw_sinks:
+                if not isinstance(raw_sink, dict) or not raw_sink.get("name"):
+                    continue
+                sinks.append(
+                    {
+                        "index": str(raw_sink.get("index", "")),
+                        "name": str(raw_sink["name"]),
+                        "description": str(
+                            raw_sink.get("description") or raw_sink["name"]
+                        ),
+                        "state": str(raw_sink.get("state", "unknown")),
+                    }
+                )
+            return sinks
+
+    # Older pactl versions may not support JSON output.
+    result = _run_audio_query(
+        ["pactl", "list", "sinks"],
+        command_runner=command_runner,
+    )
+    if result is None or result.returncode != 0:
+        return []
+
+    sinks = []
+    current = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        match = re.fullmatch(r"Sink #(\d+)", stripped)
+        if match:
+            if current and current.get("name"):
+                current["description"] = current.get("description") or current["name"]
+                sinks.append(current)
+            current = {
+                "index": match.group(1),
+                "name": "",
+                "description": "",
+                "state": "unknown",
+            }
+        elif current is not None and stripped.startswith("Name:"):
+            current["name"] = stripped.partition(":")[2].strip()
+        elif current is not None and stripped.startswith("Description:"):
+            current["description"] = stripped.partition(":")[2].strip()
+        elif current is not None and stripped.startswith("State:"):
+            current["state"] = stripped.partition(":")[2].strip()
+
+    if current and current.get("name"):
+        current["description"] = current.get("description") or current["name"]
+        sinks.append(current)
+    return sinks
+
+
+def get_default_system_sink(command_runner=None):
+    if shutil.which("pactl") is None:
+        return None
+
+    result = _run_audio_query(
+        ["pactl", "get-default-sink"],
+        command_runner=command_runner,
+    )
+    if result is not None and result.returncode == 0:
+        default_sink = result.stdout.strip()
+        if default_sink:
+            return default_sink
+
+    result = _run_audio_query(
+        ["pactl", "info"],
+        command_runner=command_runner,
+    )
+    if result is not None and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Default Sink:"):
+                return line.partition(":")[2].strip() or None
+    return None
+
+
+def resolve_system_sink(selection, sinks):
+    """Resolve an index, sink ID, or friendly description to one sink."""
+    requested = selection.strip()
+    if requested.casefold() in {"default", "system", "auto"}:
+        return None
+
+    for sink in sinks:
+        if requested == sink["name"]:
+            return sink
+
+    normalized = requested.casefold()
+    exact_matches = [
+        sink
+        for sink in sinks
+        if normalized
+        in {
+            sink.get("index", "").casefold(),
+            sink.get("description", "").casefold(),
+        }
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    partial_matches = [
+        sink
+        for sink in sinks
+        if normalized in sink.get("name", "").casefold()
+        or normalized in sink.get("description", "").casefold()
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    if exact_matches or partial_matches:
+        matches = exact_matches or partial_matches
+        descriptions = ", ".join(
+            f'{sink["description"]} ({sink["name"]})' for sink in matches
+        )
+        raise ControllerError(
+            f'Speaker selection "{selection}" is ambiguous: {descriptions}'
+        )
+
+    raise ControllerError(
+        f'System audio speaker not found: "{selection}". '
+        "Run with --list-speakers to see available choices."
+    )
+
+
+def print_available_speakers(command_runner=None):
+    sinks = get_system_audio_sinks(command_runner=command_runner)
+    if not sinks:
+        raise ControllerError(
+            "No Linux system audio speakers were found. Confirm that pactl can "
+            "connect to the current user's audio session."
+        )
+
+    default_sink = get_default_system_sink(command_runner=command_runner)
+    print("Available Linux system audio speakers:\n")
+    for sink in sinks:
+        marker = " [default]" if sink["name"] == default_sink else ""
+        state = sink.get("state", "unknown").lower()
+        print(f'  {sink["description"]}{marker}')
+        print(f'    sink: {sink["name"]}')
+        print(f'    state: {state}\n')
+
+    print('Select one with --speaker "DESCRIPTION" or --speaker "SINK".')
+
+
+def get_alsa_microphones(command_runner=None):
+    """Return physical ALSA capture devices with stable named selectors."""
+    if shutil.which("arecord") is None:
+        return []
+
+    result = _run_audio_query(
+        ["arecord", "--list-devices"],
+        command_runner=command_runner,
+    )
+    if result is None or result.returncode != 0:
+        return []
+
+    microphones = []
+    device_pattern = re.compile(
+        r"^card\s+(?P<card_index>\d+):\s+"
+        r"(?P<card_id>\S+)\s+\[(?P<card_description>[^]]+)\],\s+"
+        r"device\s+(?P<device_index>\d+):\s+"
+        r"(?P<device_name>.*?)\s+\[(?P<device_description>[^]]*)\]\s*$"
+    )
+    for line in result.stdout.splitlines():
+        match = device_pattern.match(line.strip())
+        if not match:
+            continue
+
+        microphone = match.groupdict()
+        microphone["selector"] = (
+            f'plughw:CARD={microphone["card_id"]},'
+            f'DEV={microphone["device_index"]}'
+        )
+        microphones.append(microphone)
+    return microphones
+
+
+def resolve_microphone(selection, microphones=None):
+    """Resolve a friendly microphone name while preserving direct ALSA names."""
+    if selection is None:
+        return None
+
+    requested = selection.strip()
+    if not requested:
+        raise ControllerError("Microphone selection cannot be empty.")
+    if requested.casefold() in {"default", "system", "auto"}:
+        return None
+
+    # Existing ALSA selectors remain valid and skip device discovery.
+    if ":" in requested:
+        return requested
+
+    microphones = microphones if microphones is not None else get_alsa_microphones()
+    for microphone in microphones:
+        if requested == microphone["selector"]:
+            return microphone["selector"]
+
+    normalized = requested.casefold()
+    exact_matches = [
+        microphone
+        for microphone in microphones
+        if normalized
+        in {
+            microphone.get("card_index", "").casefold(),
+            microphone.get("card_id", "").casefold(),
+            microphone.get("card_description", "").casefold(),
+            microphone.get("device_description", "").casefold(),
+        }
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]["selector"]
+
+    partial_matches = [
+        microphone
+        for microphone in microphones
+        if any(
+            normalized in microphone.get(field, "").casefold()
+            for field in (
+                "card_id",
+                "card_description",
+                "device_name",
+                "device_description",
+                "selector",
+            )
+        )
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0]["selector"]
+
+    if exact_matches or partial_matches:
+        matches = exact_matches or partial_matches
+        descriptions = ", ".join(
+            f'{microphone["card_description"]} '
+            f'({microphone["selector"]})'
+            for microphone in matches
+        )
+        raise ControllerError(
+            f'Microphone selection "{selection}" is ambiguous: {descriptions}'
+        )
+
+    raise ControllerError(
+        f'ALSA microphone not found: "{selection}". '
+        "Run with --list-microphones to see available choices."
+    )
+
+
+def print_available_microphones(command_runner=None):
+    microphones = get_alsa_microphones(command_runner=command_runner)
+    if not microphones:
+        raise ControllerError(
+            "No ALSA microphones were found. Confirm that the input is attached "
+            "and visible in arecord --list-devices."
+        )
+
+    print("Available ALSA microphones:\n")
+    for microphone in microphones:
+        print(f'  {microphone["card_description"]}')
+        print(f'    input: {microphone["selector"]}')
+        print(f'    device: {microphone["device_description"]}\n')
+
+    print(
+        'Select one with --microphone "DESCRIPTION" or '
+        '--microphone "INPUT".'
+    )
+
+
 class PiperSpeechOutput:
     """Synthesize responses with Piper and play them through Linux audio."""
 
@@ -345,13 +640,30 @@ class PiperSpeechOutput:
         self,
         model_path,
         playback_device=None,
+        playback_sink=None,
         voice_loader=None,
         player_runner=None,
+        sink_lister=None,
     ):
         self.model_path = Path(model_path).expanduser()
         self.config_path = Path(f"{self.model_path}.json")
         self.playback_device = playback_device
+        self.playback_sink = None
+        self.speaker_label = "Linux system default"
         self.player_runner = player_runner or subprocess.run
+
+        if playback_device and playback_sink:
+            raise ControllerError(
+                "Choose either --speaker or --speaker-device, not both."
+            )
+        if playback_device:
+            self.speaker_label = f"direct ALSA device {playback_device}"
+        elif playback_sink:
+            sinks = (sink_lister or get_system_audio_sinks)()
+            resolved_sink = resolve_system_sink(playback_sink, sinks)
+            if resolved_sink is not None:
+                self.playback_sink = resolved_sink["name"]
+                self.speaker_label = resolved_sink["description"]
 
         self.players = self._available_players()
         if not self.players:
@@ -389,6 +701,14 @@ class PiperSpeechOutput:
                 )
             return ["aplay"]
 
+        if self.playback_sink:
+            if shutil.which("paplay") is None:
+                raise ControllerError(
+                    "Manual system speaker selection needs 'paplay'. Install "
+                    "the PulseAudio command-line utilities."
+                )
+            return ["paplay"]
+
         # paplay and pw-play follow the desktop's selected system output, which
         # includes Bluetooth sinks. aplay remains a fallback for direct ALSA.
         return [
@@ -404,6 +724,13 @@ class PiperSpeechOutput:
                 command.extend(["--device", self.playback_device])
             command.append(str(speech_path))
             return command
+
+        if player == "paplay" and self.playback_sink:
+            return [
+                "paplay",
+                f"--device={self.playback_sink}",
+                str(speech_path),
+            ]
 
         return [player, str(speech_path)]
 
@@ -678,9 +1005,8 @@ def parse_args(argv=None):
         help="enable local push-to-talk input through whisper.cpp",
     )
     input_mode.add_argument(
-        "--wake-listen",
-        "--always-listen",
-        dest="wake_listen",
+        "--listen",
+        dest="listen",
         action="store_true",
         help="continuously listen for a wake word before recording a command",
     )
@@ -692,12 +1018,27 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--microphone",
-        help="optional ALSA capture device, for example plughw:2,0",
+        help=(
+            "microphone description or ALSA input from --list-microphones, "
+            "for example plughw:CARD=Microphone,DEV=0"
+        ),
+    )
+    parser.add_argument(
+        "--list-microphones",
+        "--list-inputs",
+        dest="list_microphones",
+        action="store_true",
+        help="list ALSA microphone names and stable inputs, then exit",
+    )
+    parser.add_argument(
+        "--list-audio",
+        action="store_true",
+        help="list both microphone inputs and speaker outputs, then exit",
     )
     parser.add_argument(
         "--wake-word",
         default=DEFAULT_WAKE_WORD,
-        help=f"wake phrase for --wake-listen (default: {DEFAULT_WAKE_WORD})",
+        help=f"wake phrase for --listen (default: {DEFAULT_WAKE_WORD})",
     )
     parser.add_argument(
         "--wake-window-seconds",
@@ -719,6 +1060,16 @@ def parse_args(argv=None):
         help=f"path to a Piper ONNX voice model (default: {DEFAULT_TTS_MODEL})",
     )
     parser.add_argument(
+        "--list-speakers",
+        action="store_true",
+        help="list wired and Bluetooth Linux audio speakers, then exit",
+    )
+    speaker_selection = parser.add_mutually_exclusive_group()
+    speaker_selection.add_argument(
+        "--speaker",
+        help="Linux speaker description, sink ID, or index from --list-speakers",
+    )
+    speaker_selection.add_argument(
         "--speaker-device",
         help="force a direct ALSA playback device, for example plughw:3,0",
     )
@@ -756,6 +1107,12 @@ def parse_args(argv=None):
         parser.error("--wake-window-seconds must be at least 1")
     if not WakeWordInput._normalize(args.wake_word):
         parser.error("--wake-word must contain a letter or number")
+    if (
+        (args.speaker or args.speaker_device)
+        and not args.speak
+        and not args.list_speakers
+    ):
+        parser.error("--speaker and --speaker-device require --speak")
 
     return args
 
@@ -768,12 +1125,24 @@ def main(argv=None):
     led = None
 
     try:
-        if args.voice or args.wake_listen:
+        if args.list_audio or args.list_speakers or args.list_microphones:
+            show_speakers = args.list_audio or args.list_speakers
+            show_microphones = args.list_audio or args.list_microphones
+            if show_speakers:
+                print_available_speakers()
+            if show_speakers and show_microphones:
+                print()
+            if show_microphones:
+                print_available_microphones()
+            return 0
+
+        if args.voice or args.listen:
+            microphone = resolve_microphone(args.microphone)
             voice_input = WhisperVoiceInput(
                 whisper_bin=args.whisper_bin,
                 whisper_model=args.whisper_model,
                 record_seconds=args.record_seconds,
-                microphone=args.microphone,
+                microphone=microphone,
                 language=args.language,
             )
             voice_input.check_ready()
@@ -783,9 +1152,10 @@ def main(argv=None):
             speech_output = PiperSpeechOutput(
                 model_path=args.tts_model,
                 playback_device=args.speaker_device,
+                playback_sink=args.speaker,
             )
 
-        if args.wake_listen:
+        if args.listen:
             wake_input = WakeWordInput(
                 voice_input=voice_input,
                 wake_word=args.wake_word,
@@ -796,17 +1166,22 @@ def main(argv=None):
         led = GpioLed(args.led_pin)
 
         print("Apartment controller started.")
-        if args.wake_listen:
+        if args.listen:
             print(
-                f'Wake-word input enabled. Say "{args.wake_word}", wait for '
+                f'Listen mode enabled. Say "{args.wake_word}", wait for '
                 "the ready message, then speak the command."
             )
         elif args.voice:
             print("Voice input enabled. Press Enter when you are ready to speak.")
         else:
             print("Text input enabled.")
+        if voice_input is not None and voice_input.microphone:
+            print(f"Microphone input: {voice_input.microphone}.")
         if speech_output is not None:
-            print("Local speech responses enabled.")
+            print(
+                "Local speech responses enabled: "
+                f"{speech_output.speaker_label}."
+            )
         print("Type 'exit' or 'quit' to stop.\n")
 
         while True:
@@ -819,7 +1194,7 @@ def main(argv=None):
                 print(f"{error}\n")
                 if wake_input is not None:
                     wake_input.close()
-                    print("Restarting the wake listener in two seconds.\n")
+                    print("Restarting the listener in two seconds.\n")
                     time.sleep(2)
                 continue
 
