@@ -9,7 +9,7 @@ No microphone audio, transcript, or apartment request is sent to a cloud API.
 Time and date remain fully local. A weather request sends only the configured
 place name and resolved coordinates to Open-Meteo; it therefore needs internet
 access. Internet is otherwise needed only for initial package and model
-downloads.
+downloads, Shelly onboarding, and device firmware updates.
 
 ## Architecture
 
@@ -23,7 +23,8 @@ whisper.cpp → transcript
 Qwen3-1.7B on llama.cpp → JSON request intent
     ↓
 Python allow-list validation
-    ├─ control → Jetson GPIO → LED standing in for desk_lamp
+    ├─ control → local Shelly RPC → lamp-1 and lamp-2
+    │             or --gpio → Jetson GPIO test LED
     ├─ time/date → Jetson system clock
     ├─ weather → Open-Meteo using the configured location
     └─ every other request → Qwen3-1.7B → short sanitized text
@@ -31,8 +32,9 @@ Python allow-list validation
         response → Piper → Linux system audio → speaker
 ```
 
-The LLM never accesses GPIO, the system clock, or the weather service directly.
-Voice and typed requests both enter the same validation and response path.
+The LLM never accesses the Shelly outlets, GPIO, the system clock, or the
+weather service directly. Voice and typed requests both enter the same
+validation and response path.
 
 ## One-time setup versus daily use
 
@@ -42,7 +44,8 @@ Voice and typed requests both enter the same validation and response path.
 | Qwen3-1.7B | Downloaded automatically on first server launch | Loaded from the local cache |
 | `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
-| Piper | Install `piper-tts` and download one voice | Speaks ready, action, information, and conversational responses on CPU |
+| Piper | Install `piper-tts` and download one voice | Speaks the wake acknowledgement, action, information, and conversational responses on CPU |
+| Shelly outlets | Join Wi-Fi, name `lamp-1` and `lamp-2`, and reserve their IPs | Controlled directly over the local network |
 | Open-Meteo | No account or API key for personal use | Queried only for a weather request |
 | Python project | Create `.venv` and install requirements | Run push-to-talk or continuous listen mode |
 
@@ -55,18 +58,18 @@ own server or terminal.
 - NVIDIA Jetson Orin Nano with JetPack and the CUDA toolkit installed
 - USB microphone or another ALSA-compatible capture device
 - USB, HDMI, or another ALSA-compatible speaker
-- Breadboard LED
-- 220–1000 Ω current-limiting resistor
-- Jumper wires
+- Two Shelly Plug US Gen4 outlets named `lamp-1` and `lamp-2`
+- Two plug-in lamps whose physical switches can remain on
+- Optional breadboard LED, 220–1000 Ω resistor, and jumper wires for `--gpio`
 
-Current physical wiring:
+Optional GPIO test wiring:
 
 - Jetson physical pin 7 — GPIO output for the LED
 - Jetson physical pin 6 — ground
 
 Wire the resistor in series with the LED. The LED anode connects toward pin 7
 and the cathode connects toward ground. Power down the Jetson before changing
-the wiring.
+the wiring. The Shelly outlets do not connect to Jetson GPIO.
 
 ## Full one-time setup
 
@@ -125,7 +128,51 @@ The requirements install `requests`, NVIDIA's `Jetson.GPIO` package, and the
 local Piper text-to-speech package. This installation happens once, not each
 time the controller starts.
 
-### 4. Configure GPIO permissions
+### 4. Configure the Shelly outlets
+
+Use the Shelly Smart Control app to join both outlets to the same local network
+as the Jetson. Give them distinct names even though they operate as one group:
+
+```text
+lamp-1
+lamp-2
+```
+
+Install current firmware and reserve both addresses in the router. Test each
+reserved address from the Jetson, replacing the examples with the actual IPs:
+
+```bash
+curl http://192.168.1.50/rpc/Shelly.GetDeviceInfo
+curl "http://192.168.1.50/rpc/Switch.GetStatus?id=0"
+
+curl http://192.168.1.51/rpc/Shelly.GetDeviceInfo
+curl "http://192.168.1.51/rpc/Switch.GetStatus?id=0"
+```
+
+The controller initially tries the default network names `lamp-1` and
+`lamp-2`. An app display name is not guaranteed to become a resolvable hostname,
+so IP overrides are the most reliable daily command:
+
+```bash
+python apartment_controller.py \
+  --outlet lamp-1=192.168.1.50 \
+  --outlet lamp-2=192.168.1.51
+```
+
+Repeat `--outlet` for every member of the logical living-room-lamp group. If
+Shelly authentication is enabled, store the shared device password in the
+process environment instead of the repository:
+
+```bash
+read -rsp "Shelly password: " SHELLY_PASSWORD
+export SHELLY_PASSWORD
+echo
+```
+
+The username is always `admin`. This prompt keeps the password out of terminal
+output and shell history; it remains available only in that shell environment.
+
+### 5. Optional: configure GPIO permissions
 
 With the project environment still active:
 
@@ -141,7 +188,7 @@ sudo udevadm trigger
 
 This permits GPIO access without running the entire controller as root.
 
-### 5. Configure physical pin 7 with Jetson-IO
+### 6. Optional: configure physical pin 7 with Jetson-IO
 
 Launch NVIDIA's header configuration tool:
 
@@ -165,7 +212,7 @@ groups
 
 The output should include `gpio`.
 
-### 6. Test the LED and GPIO
+### 7. Optional: test the LED and GPIO
 
 ```bash
 cd ~/apartment-ai
@@ -174,9 +221,10 @@ python gpio_test.py
 ```
 
 The LED should alternate on and off every two seconds. Press Ctrl+C to stop; the
-cleanup code leaves the LED off.
+cleanup code leaves the LED off. This hardware is used only when the controller
+starts with `--gpio`.
 
-### 7. Build llama.cpp for Qwen
+### 8. Build llama.cpp for Qwen
 
 `llama.cpp` is the local LLM runtime. It builds the HTTP server that the Python
 controller calls.
@@ -216,7 +264,7 @@ the Q4_K_M model. Later launches use the local cached copy. The 1.7B model is
 the default because it leaves more shared-memory and power headroom for
 continuous Whisper transcription and the desktop audio services.
 
-### 8. Build whisper.cpp for speech-to-text
+### 9. Build whisper.cpp for speech-to-text
 
 `whisper.cpp` is separate from `llama.cpp`. It builds the command-line program
 that converts recorded audio into text.
@@ -261,7 +309,7 @@ Test the build with the sample included in `whisper.cpp`:
 
 A successful run prints an English transcription.
 
-### 9. Check the microphone
+### 10. Check the microphone
 
 List available capture devices:
 
@@ -299,7 +347,7 @@ paplay mic-test.wav
 Replace the example selector with the `input:` value printed by
 `--list-microphones`.
 
-### 10. Download a Piper voice and test the speaker
+### 11. Download a Piper voice and test the speaker
 
 The default speech model is the English `en_US-lessac-medium` voice:
 
@@ -326,7 +374,7 @@ python -m piper \
   --data-dir voices \
   --model en_US-lessac-medium \
   -f tts-test.wav \
-  -- "Ready."
+  -- "What's up?"
 
 paplay tts-test.wav
 ```
@@ -342,8 +390,8 @@ speaker currently visible to Linux:
 python apartment_controller.py --list-speakers
 ```
 
-This listing exits without loading Piper, Whisper, the LLM, or GPIO, so it can
-also be run remotely over SSH.
+This listing exits without loading Piper, Whisper, the LLM, or a device output,
+so it can also be run remotely over SSH.
 
 To list both microphone inputs and speaker outputs in one remote command:
 
@@ -351,7 +399,7 @@ To list both microphone inputs and speaker outputs in one remote command:
 python apartment_controller.py --list-audio
 ```
 
-### 11. Run the software tests
+### 12. Run the software tests
 
 ```bash
 cd ~/apartment-ai
@@ -361,7 +409,7 @@ python -m unittest -v
 
 These tests simulate the voice, LLM classification, conversational response,
 clock, and weather boundaries. They do not record from the real microphone,
-contact the live weather service, or change GPIO.
+contact the live weather service, or change GPIO or a real outlet.
 
 ## Daily operation
 
@@ -404,10 +452,22 @@ The prompt shows:
 Press Enter to speak, type a request, or type 'quit':
 ```
 
-Press Enter, then say a short request such as “turn on my desk lamp.” The
-controller records for five seconds, transcribes the audio locally, displays
-what it heard, sends the transcript to Qwen, validates Qwen's JSON response, and
-changes the LED only if the control request is allowed.
+Press Enter, then say a short request such as “turn on my living room lamps.”
+The controller records for five seconds, transcribes the audio locally,
+displays what it heard, sends the transcript to Qwen, validates Qwen's JSON
+response, and sends the action to both Shelly outlets only if the control
+request is allowed.
+Each outlet is queried afterward, and the controller reports success only when
+both confirm the requested state.
+
+If the router does not resolve the default names, use the reserved IP addresses:
+
+```bash
+python apartment_controller.py \
+  --voice \
+  --outlet lamp-1=192.168.1.50 \
+  --outlet lamp-2=192.168.1.51
+```
 
 For a non-default microphone:
 
@@ -427,7 +487,16 @@ python apartment_controller.py --voice --record-seconds 7
 ```
 
 Typing text at the voice prompt bypasses recording for that request. Type
-`exit` or `quit`, or press Ctrl+C, to stop. The cleanup path leaves the LED off.
+`exit` or `quit`, or press Ctrl+C, to stop. Network outlets retain their current
+state when the controller exits.
+
+To use the original GPIO LED instead of the outlets:
+
+```bash
+python apartment_controller.py --voice --gpio
+```
+
+GPIO cleanup forces the test LED off when the controller exits.
 
 ### Terminal 2 option B: continuous listen mode
 
@@ -443,19 +512,20 @@ python apartment_controller.py --listen --speak
 The default wake word is `command`. Use it in two stages:
 
 1. Say “command.”
-2. Wait for the spoken “Ready” response and the `Recording request...` message.
-3. Say “turn on my desk lamp.”
+2. Wait for the spoken “What’s up?” response and the `Recording request...`
+   message.
+3. Say “turn on my living room lamps.”
 
 The microphone remains open through one `arecord` process. Python continuously
 buffers local audio while Whisper examines overlapping two-second windows. When
 the wake word is detected, old buffered audio is discarded and a fresh
 five-second request is recorded. The microphone audio containing the spoken
-“Ready” response is discarded before recording begins. Only the post-wake
+“What’s up?” response is discarded before recording begins. Only the post-wake
 request transcript enters the Qwen interpretation and validation path.
 
-After an allowed GPIO action succeeds, Piper says either “Desk lamp turned on”
-or “Desk lamp turned off.” Device confirmations remain fixed Python responses,
-not conversational LLM output.
+After both outlets confirm an allowed action, Piper says either “Living room
+lamps turned on” or “Living room lamps turned off.” Device confirmations remain
+fixed Python responses, not conversational LLM output.
 
 Use a more distinctive wake phrase if `command` triggers too easily:
 
@@ -534,7 +604,7 @@ deleted after each check. Press Ctrl+C to stop.
 ### Time, date, and weather responses
 
 Information requests work in text, push-to-talk, and continuous listen modes.
-For example, after the wake word and ready response, say:
+For example, after the wake word and “What’s up?” response, say:
 
 ```text
 What time is it?
@@ -608,21 +678,25 @@ python apartment_controller.py
 The only allowed request intents are:
 
 ```text
-control → desk_lamp → on
-control → desk_lamp → off
+control → desk_lamp (living room lamps) → on
+control → desk_lamp (living room lamps) → off
 time
 date
 weather
 conversation
 ```
 
-Only the exact allow-listed desk-lamp control shapes can enter the GPIO output
-path. Invalid classifier JSON, non-object results, unknown intents, unknown
-devices, invalid actions, and the legacy `none` intent all route to
-conversation instead. Microphone, transcription, LLM connection, and malformed
-server-envelope errors stop the request without changing GPIO. Time, date,
-weather, and conversation cannot enter the output path, and the LED is forced
-off during normal controller shutdown.
+Only the exact allow-listed living-room-lamp control shapes can enter the
+device output path. By default, every valid action is sent to `lamp-1` and
+`lamp-2`, and each reported output state must match before success is announced.
+A failure still allows the other outlet to be attempted and reports that the
+group may be in a partial state. Invalid classifier JSON, non-object results,
+unknown intents, unknown devices, invalid actions, and the legacy `none` intent
+all route to conversation instead. Microphone, transcription, LLM connection,
+and malformed server-envelope errors stop the request without changing an
+output. Time, date, weather, and conversation cannot enter the device output
+path. In `--gpio` mode, the LED is forced off during normal controller shutdown;
+network outlets retain their state.
 
 ## Useful options
 
@@ -634,8 +708,8 @@ python apartment_controller.py --help
 - `--listen` enables continuous listen mode with wake-word detection.
 - `--wake-word PHRASE` changes the default `command` wake phrase.
 - `--wake-window-seconds N` changes the wake-detection audio window.
-- `--speak` enables local Piper ready, action, information, and conversational
-  responses.
+- `--speak` enables the local Piper wake acknowledgement, action, information,
+  and conversational responses.
 - `--tts-model PATH` selects a different Piper ONNX voice model.
 - `--list-speakers` lists wired and Bluetooth system-audio outputs, then exits.
 - `--speaker NAME` selects a system speaker by description, sink ID, or index.
@@ -649,7 +723,10 @@ python apartment_controller.py --help
 - `--whisper-model PATH` selects a different Whisper model.
 - `--llm-url URL` selects a different chat-completions endpoint.
 - `--weather-location PLACE` selects the city or postal code used for weather.
-- `--led-pin N` changes the physical BOARD pin used for the LED.
+- `--outlet HOST` replaces the default outlets; repeat it for every group member.
+- `--outlet NAME=HOST` preserves a friendly name while using a reserved IP.
+- `--gpio` uses the original Jetson GPIO LED instead of Shelly outlets.
+- `--led-pin N` changes the physical BOARD pin used with `--gpio`.
 
 ## Troubleshooting
 
@@ -724,7 +801,7 @@ and try another USB port.
 
 ### Wake word is missed or triggers accidentally
 
-Speak the wake phrase by itself and wait for the ready message before saying the
+Speak the wake phrase by itself and wait for “What’s up?” before saying the
 apartment request. Try a distinctive phrase such as `hey apartment`, or increase
 `--wake-window-seconds` from 2 to 3. Push-to-talk mode remains available when
 continuous Whisper scanning uses too much GPU time.
@@ -766,7 +843,32 @@ python apartment_controller.py \
 
 Weather requires an internet connection. A missing location, failed location
 match, network timeout, or unexpected service response is rejected without
-changing GPIO. Restart the controller after changing the location.
+changing the device output. Restart the controller after changing the location.
+
+### Shelly outlet cannot be reached
+
+An app name such as `lamp-1` may not be registered as a hostname by the router.
+Test the reserved IP directly from the Jetson:
+
+```bash
+curl http://192.168.1.50/rpc/Shelly.GetDeviceInfo
+curl "http://192.168.1.50/rpc/Switch.GetStatus?id=0"
+```
+
+If the IP works, start the controller with explicit mappings:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --outlet lamp-1=192.168.1.50 \
+  --outlet lamp-2=192.168.1.51
+```
+
+If the response is `401 Unauthorized`, set `SHELLY_PASSWORD` to the password
+configured on both devices. If neither the name nor IP works, confirm that the
+Jetson and outlets are on the same LAN and that the Wi-Fi network does not use
+guest/client isolation.
 
 ### GPIO permission error
 
@@ -797,6 +899,9 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 - [Open-Meteo forecast API](https://open-meteo.com/en/docs)
 - [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api)
 - [Open-Meteo data license](https://open-meteo.com/en/licence)
+- [Shelly Plug US Gen4 documentation](https://us.shelly.com/blogs/documentation/shelly-plug-us-gen4)
+- [Shelly local Switch RPC API](https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/)
+- [Shelly local API authentication](https://shelly-api-docs.shelly.cloud/gen2/General/Authentication/)
 - [NVIDIA Jetson.GPIO setup](https://github.com/NVIDIA/jetson-gpio)
 - [NVIDIA JetPack 7.2.1 release information](https://developer.nvidia.com/embedded/jetpack/downloads)
 - [NVIDIA Jetson-IO documentation for Jetson Linux 39.2](https://docs.nvidia.com/jetson/archives/r39.2/DeveloperGuide/HR/ConfiguringTheJetsonExpansionHeaders.html)
@@ -808,5 +913,4 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 - Replace continuous Whisper scanning with a smaller dedicated wake-word model
 - Add optional multi-turn conversational memory
 - Home Assistant integration
-- Smart plugs and multiple lights
 - Environmental and presence sensors

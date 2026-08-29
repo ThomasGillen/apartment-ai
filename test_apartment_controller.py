@@ -12,9 +12,12 @@ from apartment_controller import (
     GpioLed,
     OpenMeteoWeather,
     PiperSpeechOutput,
+    ShellyOutlet,
+    ShellyOutletGroup,
     WakeWordInput,
     WhisperVoiceInput,
     clean_conversation_response,
+    create_device_output,
     current_date_response,
     current_time_response,
     execute_request,
@@ -24,6 +27,7 @@ from apartment_controller import (
     interpret_request,
     main,
     parse_args,
+    parse_outlet_target,
     resolve_microphone,
     resolve_system_sink,
     validate_request,
@@ -198,7 +202,7 @@ class InformationResponseTests(unittest.TestCase):
 
     def test_executes_control_through_device_output(self):
         output = Mock()
-        output.apply.return_value = "Desk lamp turned on."
+        output.apply.return_value = "Living room lamps turned on."
 
         response = execute_request(
             ("control", "desk_lamp", "on"),
@@ -206,7 +210,7 @@ class InformationResponseTests(unittest.TestCase):
             Mock(),
         )
 
-        self.assertEqual(response, "Desk lamp turned on.")
+        self.assertEqual(response, "Living room lamps turned on.")
         output.apply.assert_called_once_with("desk_lamp", "on")
 
     def test_executes_conversation_without_touching_gpio(self):
@@ -310,7 +314,7 @@ class VoiceInputTests(unittest.TestCase):
             if Path(command[0]).name == "whisper-cli":
                 output_base = Path(command[command.index("--output-file") + 1])
                 output_base.with_suffix(".txt").write_text(
-                    "turn the desk lamp on\n", encoding="utf-8"
+                    "turn the living room lamps on\n", encoding="utf-8"
                 )
             return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -324,7 +328,7 @@ class VoiceInputTests(unittest.TestCase):
 
         transcript = voice.listen()
 
-        self.assertEqual(transcript, "turn the desk lamp on")
+        self.assertEqual(transcript, "turn the living room lamps on")
         record_command = run.call_args_list[0].args[0]
         whisper_command = run.call_args_list[1].args[0]
         self.assertIn("--duration", record_command)
@@ -371,7 +375,7 @@ class WakeWordInputTests(unittest.TestCase):
         voice.transcribe_pcm.side_effect = [
             "background speech",
             "please say COMMAND!",
-            "turn the desk lamp on",
+            "turn the living room lamps on",
         ]
         stream_factory = Mock(return_value=stream)
         wake_input = WakeWordInput(
@@ -383,7 +387,7 @@ class WakeWordInputTests(unittest.TestCase):
 
         transcript = wake_input.listen()
 
-        self.assertEqual(transcript, "turn the desk lamp on")
+        self.assertEqual(transcript, "turn the living room lamps on")
         self.assertEqual(
             [call.args[0] for call in stream.read_seconds.call_args_list],
             [2, 2, 5],
@@ -404,7 +408,7 @@ class WakeWordInputTests(unittest.TestCase):
         self.assertFalse(wake_input._contains_wake_word("commander reporting"))
         self.assertTrue(wake_input._contains_wake_word("Command, please"))
 
-    def test_says_ready_then_discards_its_own_speaker_audio(self):
+    def test_says_acknowledgement_then_discards_its_own_speaker_audio(self):
         stream = Mock()
         stream.read_seconds.side_effect = [b"wake", b"command"]
         voice = Mock(microphone=None, record_seconds=5)
@@ -419,7 +423,7 @@ class WakeWordInputTests(unittest.TestCase):
         transcript = wake_input.listen()
 
         self.assertEqual(transcript, "lights on")
-        speech_output.speak.assert_called_once_with("Ready.")
+        speech_output.speak.assert_called_once_with("What's up?")
         self.assertEqual(stream.discard_buffer.call_count, 2)
 
 
@@ -444,7 +448,7 @@ class SpeechOutputTests(unittest.TestCase):
             voice = Mock()
 
             def synthesize(text, wav_file):
-                self.assertEqual(text, "Ready.")
+                self.assertEqual(text, "What's up?")
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(22050)
@@ -462,7 +466,7 @@ class SpeechOutputTests(unittest.TestCase):
                 player_runner=player_runner,
             )
 
-            speech_output.speak("Ready.")
+            speech_output.speak("What's up?")
 
             voice_loader.assert_called_once_with(str(model_path), use_cuda=False)
             play_command = player_runner.call_args.args[0]
@@ -494,7 +498,7 @@ class SpeechOutputTests(unittest.TestCase):
                 player_runner=player_runner,
             )
 
-            speech_output.speak("Ready.")
+            speech_output.speak("What's up?")
 
             play_command = player_runner.call_args.args[0]
             self.assertEqual(play_command[0], "paplay")
@@ -531,7 +535,7 @@ class SpeechOutputTests(unittest.TestCase):
                 player_runner=player_runner,
             )
 
-            speech_output.speak("Ready.")
+            speech_output.speak("What's up?")
 
             play_command = player_runner.call_args.args[0]
             self.assertEqual(play_command[0], "paplay")
@@ -567,7 +571,7 @@ class SpeechOutputTests(unittest.TestCase):
                 player_runner=player_runner,
             )
 
-            speech_output.speak("Ready.")
+            speech_output.speak("What's up?")
 
             self.assertEqual(player_runner.call_count, 2)
             self.assertEqual(player_runner.call_args_list[0].args[0][0], "paplay")
@@ -694,11 +698,108 @@ class GpioLedTests(unittest.TestCase):
 
         self.assertEqual(
             led.apply("desk_lamp", "on"),
-            "Desk lamp turned on.",
+            "Living room lamps turned on.",
         )
         self.assertEqual(
             led.apply("desk_lamp", "off"),
-            "Desk lamp turned off.",
+            "Living room lamps turned off.",
+        )
+
+
+class ShellyOutletTests(unittest.TestCase):
+    @staticmethod
+    def response(payload, status_code=200):
+        response = Mock(status_code=status_code)
+        response.raise_for_status.return_value = None
+        response.json.return_value = payload
+        return response
+
+    def test_sets_and_verifies_local_outlet_state(self):
+        client = Mock()
+        client.get.side_effect = [
+            self.response({"was_on": False}),
+            self.response({"id": 0, "output": True}),
+        ]
+        outlet = ShellyOutlet(
+            name="lamp-1",
+            host="192.168.1.50",
+            http_client=client,
+        )
+
+        outlet.set_power(True)
+
+        set_call = client.get.call_args_list[0]
+        self.assertEqual(
+            set_call.args[0],
+            "http://192.168.1.50/rpc/Switch.Set",
+        )
+        self.assertEqual(set_call.kwargs["params"]["on"], "true")
+        self.assertEqual(set_call.kwargs["params"]["tag"], "apartment-ai")
+        status_call = client.get.call_args_list[1]
+        self.assertEqual(
+            status_call.args[0],
+            "http://192.168.1.50/rpc/Switch.GetStatus",
+        )
+
+    def test_rejects_unconfirmed_outlet_state(self):
+        client = Mock()
+        client.get.side_effect = [
+            self.response({"was_on": False}),
+            self.response({"id": 0, "output": False}),
+        ]
+        outlet = ShellyOutlet(
+            name="lamp-1",
+            host="192.168.1.50",
+            http_client=client,
+        )
+
+        with self.assertRaisesRegex(ControllerError, "should be on"):
+            outlet.set_power(True)
+
+    def test_reports_authentication_failure_with_environment_hint(self):
+        client = Mock()
+        client.get.return_value = self.response({}, status_code=401)
+        outlet = ShellyOutlet(
+            name="lamp-1",
+            host="192.168.1.50",
+            http_client=client,
+        )
+
+        with self.assertRaisesRegex(ControllerError, "SHELLY_PASSWORD"):
+            outlet.get_power()
+
+    def test_group_updates_every_outlet_as_one_logical_device(self):
+        first = Mock(name="first")
+        first.name = "lamp-1"
+        second = Mock(name="second")
+        second.name = "lamp-2"
+        group = ShellyOutletGroup([first, second])
+
+        self.assertEqual(
+            group.apply("desk_lamp", "off"),
+            "Living room lamps turned off.",
+        )
+        first.set_power.assert_called_once_with(False)
+        second.set_power.assert_called_once_with(False)
+
+    def test_group_attempts_every_outlet_and_reports_partial_failure(self):
+        first = Mock(name="first")
+        first.name = "lamp-1"
+        first.set_power.side_effect = ControllerError("lamp-1 is offline")
+        second = Mock(name="second")
+        second.name = "lamp-2"
+        group = ShellyOutletGroup([first, second])
+
+        with self.assertRaisesRegex(ControllerError, "lamp-1 is offline"):
+            group.apply("desk_lamp", "on")
+
+        second.set_power.assert_called_once_with(True)
+
+    def test_parses_friendly_name_and_host_override(self):
+        self.assertEqual(parse_outlet_target("lamp-1"), ("lamp-1", "lamp-1"))
+        self.assertEqual(
+            parse_outlet_target("lamp-1=192.168.1.50"),
+            ("lamp-1", "192.168.1.50"),
         )
 
 
@@ -724,6 +825,47 @@ class CommandLineTests(unittest.TestCase):
         args = parse_args(["--weather-location", "Boston, MA"])
 
         self.assertEqual(args.weather_location, "Boston, MA")
+
+    def test_shelly_outlets_are_the_default_output(self):
+        args = parse_args([])
+
+        self.assertFalse(args.gpio)
+        self.assertIsNone(args.outlet_hosts)
+
+    @patch.dict("apartment_controller.os.environ", {}, clear=True)
+    def test_default_output_builds_the_two_named_outlets(self):
+        output = create_device_output(parse_args([]))
+
+        self.assertIsInstance(output, ShellyOutletGroup)
+        self.assertEqual(
+            [outlet.name for outlet in output.outlets],
+            ["lamp-1", "lamp-2"],
+        )
+
+    def test_gpio_selects_led_output(self):
+        args = parse_args(["--gpio", "--led-pin", "11"])
+
+        self.assertTrue(args.gpio)
+        self.assertEqual(args.led_pin, 11)
+
+    def test_accepts_repeated_outlet_overrides(self):
+        args = parse_args(
+            [
+                "--outlet",
+                "lamp-1=192.168.1.50",
+                "--outlet",
+                "lamp-2=192.168.1.51",
+            ]
+        )
+
+        self.assertEqual(
+            args.outlet_hosts,
+            ["lamp-1=192.168.1.50", "lamp-2=192.168.1.51"],
+        )
+
+    def test_rejects_outlet_overrides_in_gpio_mode(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            parse_args(["--gpio", "--outlet", "lamp-1"])
 
     @patch("apartment_controller.print_available_speakers")
     def test_speaker_listing_exits_before_hardware_initialization(self, listing):

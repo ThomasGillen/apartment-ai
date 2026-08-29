@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import queue
 import re
 import shutil
@@ -18,7 +19,12 @@ DEFAULT_WHISPER_BIN = "~/whisper.cpp/build/bin/whisper-cli"
 DEFAULT_WHISPER_MODEL = "~/whisper.cpp/models/ggml-base.en.bin"
 DEFAULT_WAKE_WORD = "command"
 DEFAULT_WAKE_WINDOW_SECONDS = 2
+WAKE_ACKNOWLEDGEMENT = "What's up?"
 DEFAULT_TTS_MODEL = "~/apartment-ai/voices/en_US-lessac-medium.onnx"
+DEFAULT_OUTLET_HOSTS = ("lamp-1", "lamp-2")
+DEFAULT_OUTLET_CHANNEL = 0
+DEFAULT_OUTLET_TIMEOUT = 5
+SHELLY_PASSWORD_ENV = "SHELLY_PASSWORD"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ATTRIBUTION = "Weather data by Open-Meteo: https://open-meteo.com/"
@@ -26,17 +32,19 @@ OPEN_METEO_ATTRIBUTION = "Weather data by Open-Meteo: https://open-meteo.com/"
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH = 2
+CONTROL_DEVICE_ID = "desk_lamp"
+CONTROL_DEVICE_NAME = "living room lamps"
 WHISPER_REQUEST_PROMPT = (
-    "A spoken apartment request or general question, such as turn the desk "
-    "lamp on, ask for the time or date, ask about the weather, or ask a "
-    "short conversational question."
+    "A spoken apartment request or general question, such as turn the living "
+    "room lamps on, ask for the time or date, ask about the weather, or ask "
+    "a short conversational question."
 )
 
 SYSTEM_PROMPT = """
 Classify one apartment request.
 
 Available devices:
-- desk_lamp
+- desk_lamp (the living room lamps)
 
 Available control actions:
 - on
@@ -62,7 +70,7 @@ Never substitute an available device for an unsupported one.
 Return ONLY JSON with no extra keys or explanation.
 
 Examples:
-Turn on the lamp -> {"intent":"control","device":"desk_lamp","action":"on"}
+Turn on the living room lamps -> {"intent":"control","device":"desk_lamp","action":"on"}
 What time is it? -> {"intent":"time"}
 What day is it? -> {"intent":"date"}
 What is the weather? -> {"intent":"weather"}
@@ -78,14 +86,14 @@ Answer the user's message directly in no more than two short sentences.
 Return plain text only, suitable for text-to-speech: no Markdown, lists, JSON,
 or analysis. If the answer requires live information you do not have, briefly
 say that. Never claim to have controlled a device; device actions are handled
-by a separate validated path. Only desk_lamp on and off are configured. If a
-request to control anything else reaches you, say briefly that you cannot
-control it and do not imply that the action happened.
+by a separate validated path. Only the living room lamps can be turned on and
+off. If a request to control anything else reaches you, say briefly that you
+cannot control it and do not imply that the action happened.
 /no_think
 """
 
 ALLOWED_CONTROL_COMMANDS = {
-    "desk_lamp": {"on", "off"},
+    CONTROL_DEVICE_ID: {"on", "off"},
 }
 INFORMATION_INTENTS = {"time", "date", "weather"}
 NON_CONTROL_INTENTS = INFORMATION_INTENTS | {"conversation"}
@@ -867,11 +875,11 @@ class WakeWordInput:
                 continue
 
             # Drop anything captured while Whisper was detecting the wake word.
-            # This makes the next recording begin after the ready message.
+            # This makes the next recording begin after the acknowledgement.
             self.stream.discard_buffer()
             print(f'\aWake word detected in: "{wake_transcript}"')
             if self.speech_output is not None:
-                self.speech_output.speak("Ready.")
+                self.speech_output.speak(WAKE_ACKNOWLEDGEMENT)
                 # Prevent the spoken response from entering the request audio.
                 self.stream.discard_buffer()
 
@@ -1079,6 +1087,206 @@ class OpenMeteoWeather:
         return payload
 
 
+class ShellyOutlet:
+    """Control and verify one Shelly switch through its local HTTP RPC API."""
+
+    def __init__(
+        self,
+        name,
+        host=None,
+        channel=DEFAULT_OUTLET_CHANNEL,
+        password=None,
+        http_client=None,
+        auth=None,
+        timeout=DEFAULT_OUTLET_TIMEOUT,
+    ):
+        self.name = name
+        self.host = (host or name).strip().rstrip("/")
+        if not self.host:
+            raise ControllerError("Shelly outlet host cannot be empty.")
+        self.base_url = (
+            self.host
+            if re.match(r"^https?://", self.host, flags=re.IGNORECASE)
+            else f"http://{self.host}"
+        )
+        self.channel = channel
+        self.http_client = http_client
+        self.timeout = timeout
+        self.auth = auth
+
+        if self.auth is None and password:
+            try:
+                from requests.auth import HTTPDigestAuth
+            except ImportError as error:
+                raise ControllerError(
+                    "Shelly authentication needs the 'requests' package."
+                ) from error
+            self.auth = HTTPDigestAuth("admin", password)
+
+    def _client(self):
+        if self.http_client is not None:
+            return self.http_client
+        try:
+            import requests
+        except ImportError as error:
+            raise ControllerError(
+                "Shelly outlet control needs the 'requests' package."
+            ) from error
+        self.http_client = requests
+        return self.http_client
+
+    def _request(self, method, params=None):
+        url = f"{self.base_url}/rpc/{method}"
+        request_options = {
+            "params": params or {},
+            "timeout": self.timeout,
+        }
+        if self.auth is not None:
+            request_options["auth"] = self.auth
+
+        try:
+            response = self._client().get(url, **request_options)
+            if getattr(response, "status_code", None) == 401:
+                raise ControllerError(
+                    f'Authentication failed for outlet "{self.name}". Set '
+                    f"{SHELLY_PASSWORD_ENV} to the device password."
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except ControllerError:
+            raise
+        except Exception as error:
+            raise ControllerError(
+                f'Could not reach outlet "{self.name}" at {self.host}: {error}'
+            ) from error
+
+        if not isinstance(payload, dict):
+            raise ControllerError(
+                f'Outlet "{self.name}" returned an unexpected response.'
+            )
+        if payload.get("error"):
+            raise ControllerError(
+                f'Outlet "{self.name}" rejected {method}: {payload["error"]}'
+            )
+        return payload
+
+    def get_power(self):
+        status = self._request(
+            "Switch.GetStatus",
+            params={"id": self.channel},
+        )
+        errors = status.get("errors") or []
+        if errors:
+            raise ControllerError(
+                f'Outlet "{self.name}" reported an error: '
+                f'{", ".join(map(str, errors))}'
+            )
+        if not isinstance(status.get("output"), bool):
+            raise ControllerError(
+                f'Outlet "{self.name}" did not report its output state.'
+            )
+        return status["output"]
+
+    def set_power(self, enabled):
+        desired_state = bool(enabled)
+        self._request(
+            "Switch.Set",
+            params={
+                "id": self.channel,
+                "on": "true" if desired_state else "false",
+                "tag": "apartment-ai",
+            },
+        )
+        actual_state = self.get_power()
+        if actual_state != desired_state:
+            expected = "on" if desired_state else "off"
+            actual = "on" if actual_state else "off"
+            raise ControllerError(
+                f'Outlet "{self.name}" should be {expected} but reported {actual}.'
+            )
+
+
+class ShellyOutletGroup:
+    """Treat multiple Shelly outlets as one allow-listed apartment device."""
+
+    def __init__(self, outlets):
+        self.outlets = list(outlets)
+        if not self.outlets:
+            raise ControllerError("At least one Shelly outlet must be configured.")
+
+    def apply(self, device, action):
+        if device != CONTROL_DEVICE_ID:
+            raise ControllerError(f"No output is configured for device: {device}")
+        if action not in {"on", "off"}:
+            raise ControllerError(
+                f"Unsupported {CONTROL_DEVICE_NAME} action: {action}"
+            )
+
+        failures = []
+        successful = []
+        for outlet in self.outlets:
+            try:
+                outlet.set_power(action == "on")
+                successful.append(outlet.name)
+            except ControllerError as error:
+                failures.append(str(error))
+
+        if failures:
+            failure_summary = "; ".join(
+                failure.rstrip(".") for failure in failures
+            )
+            partial_warning = (
+                f" Updated before the failure: {', '.join(successful)}."
+                if successful
+                else ""
+            )
+            raise ControllerError(
+                f"Could not turn every living room lamp {action}: "
+                f"{failure_summary}.{partial_warning}"
+            )
+
+        outlet_names = ", ".join(outlet.name for outlet in self.outlets)
+        print(
+            f">>> {CONTROL_DEVICE_NAME.upper()} {action.upper()} "
+            f"({outlet_names})\n"
+        )
+        return f"{CONTROL_DEVICE_NAME.capitalize()} turned {action}."
+
+    @staticmethod
+    def cleanup():
+        # Network outlets retain their state when the controller exits.
+        return None
+
+
+def parse_outlet_target(target):
+    """Parse HOST or NAME=HOST while keeping friendly labels for failures."""
+    value = target.strip()
+    if not value:
+        raise ControllerError("Outlet target cannot be empty.")
+    if "=" not in value:
+        return value, value
+
+    name, host = (part.strip() for part in value.split("=", 1))
+    if not name or not host:
+        raise ControllerError(
+            f'Invalid outlet target "{target}"; use HOST or NAME=HOST.'
+        )
+    return name, host
+
+
+def create_device_output(args):
+    if args.gpio:
+        return GpioLed(args.led_pin)
+
+    targets = args.outlet_hosts or DEFAULT_OUTLET_HOSTS
+    password = os.environ.get(SHELLY_PASSWORD_ENV)
+    outlets = []
+    for target in targets:
+        name, host = parse_outlet_target(target)
+        outlets.append(ShellyOutlet(name=name, host=host, password=password))
+    return ShellyOutletGroup(outlets)
+
+
 class GpioLed:
     def __init__(self, pin):
         try:
@@ -1096,17 +1304,17 @@ class GpioLed:
         self.gpio.setup(self.pin, self.gpio.OUT, initial=self.gpio.LOW)
 
     def apply(self, device, action):
-        if device != "desk_lamp":
+        if device != CONTROL_DEVICE_ID:
             raise ControllerError(f"No output is configured for device: {device}")
 
         if action == "on":
             self.gpio.output(self.pin, self.gpio.HIGH)
-            print(">>> DESK LAMP ON\n")
-            return "Desk lamp turned on."
+            print(f">>> {CONTROL_DEVICE_NAME.upper()} ON\n")
+            return f"{CONTROL_DEVICE_NAME.capitalize()} turned on."
         elif action == "off":
             self.gpio.output(self.pin, self.gpio.LOW)
-            print(">>> DESK LAMP OFF\n")
-            return "Desk lamp turned off."
+            print(f">>> {CONTROL_DEVICE_NAME.upper()} OFF\n")
+            return f"{CONTROL_DEVICE_NAME.capitalize()} turned off."
 
         return None
 
@@ -1285,7 +1493,7 @@ def validate_request(request):
         )
         return "conversation", None, None
 
-    print(f"Validated request: control {device} -> {action}")
+    print(f"Validated request: control {CONTROL_DEVICE_NAME} -> {action}")
     return intent, device, action
 
 
@@ -1403,7 +1611,8 @@ def parse_args(argv=None):
         "--speak",
         action="store_true",
         help=(
-            "speak local ready, action, information, and conversational "
+            "speak the local wake acknowledgement, action, information, and "
+            "conversational "
             "responses with Piper"
         ),
     )
@@ -1453,10 +1662,28 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--gpio",
+        action="store_true",
+        help="use the Jetson GPIO LED instead of the default Shelly outlets",
+    )
+    parser.add_argument(
+        "--outlet",
+        dest="outlet_hosts",
+        action="append",
+        metavar="HOST",
+        help=(
+            "Shelly hostname/IP, or NAME=HOST; repeat for multiple outlets "
+            "(default: lamp-1 and lamp-2)"
+        ),
+    )
+    parser.add_argument(
         "--led-pin",
         type=int,
         default=DEFAULT_LED_PIN,
-        help=f"physical Jetson BOARD pin (default: {DEFAULT_LED_PIN})",
+        help=(
+            "physical Jetson BOARD pin used with --gpio "
+            f"(default: {DEFAULT_LED_PIN})"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1472,6 +1699,8 @@ def parse_args(argv=None):
         and not args.list_speakers
     ):
         parser.error("--speaker and --speaker-device require --speak")
+    if args.gpio and args.outlet_hosts:
+        parser.error("--outlet cannot be combined with --gpio")
 
     return args
 
@@ -1482,7 +1711,7 @@ def main(argv=None):
     wake_input = None
     speech_output = None
     weather = None
-    led = None
+    device_output = None
 
     try:
         if args.list_audio or args.list_speakers or args.list_microphones:
@@ -1524,13 +1753,13 @@ def main(argv=None):
             )
 
         weather = OpenMeteoWeather(args.weather_location)
-        led = GpioLed(args.led_pin)
+        device_output = create_device_output(args)
 
         print("Apartment controller started.")
         if args.listen:
             print(
                 f'Listen mode enabled. Say "{args.wake_word}", wait for '
-                "the ready message, then speak the request."
+                f'"{WAKE_ACKNOWLEDGEMENT}", then speak the request.'
             )
         elif args.voice:
             print("Voice input enabled. Press Enter when you are ready to speak.")
@@ -1545,6 +1774,13 @@ def main(argv=None):
             )
         if args.weather_location:
             print(f"Weather location: {args.weather_location}.")
+        if args.gpio:
+            print(f"Device output: GPIO LED on BOARD pin {args.led_pin}.")
+        else:
+            outlet_names = ", ".join(
+                outlet.name for outlet in device_output.outlets
+            )
+            print(f"Device output: Shelly outlets {outlet_names}.")
         print("Type 'exit' or 'quit' to stop.\n")
 
         while True:
@@ -1573,7 +1809,7 @@ def main(argv=None):
                 request = interpret_request(user_text, args.llm_url)
                 response_text = execute_request(
                     request,
-                    led,
+                    device_output,
                     weather,
                     user_text=user_text,
                     llm_url=args.llm_url,
@@ -1611,9 +1847,10 @@ def main(argv=None):
     finally:
         if wake_input is not None:
             wake_input.close()
-        if led is not None:
-            led.cleanup()
-            print("GPIO cleaned up.")
+        if device_output is not None:
+            device_output.cleanup()
+            if args.gpio:
+                print("GPIO cleaned up.")
 
     return 0
 
