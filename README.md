@@ -1,9 +1,10 @@
 # Apartment AI
 
 A local-first apartment automation project for an NVIDIA Jetson Orin Nano. A
-spoken request is transcribed by `whisper.cpp`, classified by Qwen running
-through `llama.cpp`, validated by Python, and handled as a device control, a
-time/date/weather response, or a short local conversational response.
+dedicated openWakeWord model listens locally for “Hey Jarvis.” After it
+activates, the spoken request is transcribed by `whisper.cpp`, classified by
+Qwen running through `llama.cpp`, validated by Python, and handled as a device
+control, a time/date/weather response, or a short local conversational response.
 
 No microphone audio, transcript, or apartment request is sent to a cloud API.
 Time and date remain fully local. A weather request sends only the configured
@@ -16,9 +17,11 @@ downloads, Shelly onboarding, and device firmware updates.
 ```text
 USB microphone
     ↓
-ALSA arecord → temporary 16 kHz mono WAV
+ALSA arecord → 16 kHz mono PCM
     ↓
-whisper.cpp → transcript
+openWakeWord → local “Hey Jarvis” activation
+    ↓
+whisper.cpp → post-activation request transcript
     ↓
 Qwen3-1.7B on llama.cpp → JSON request intent
     ↓
@@ -42,7 +45,8 @@ validation and response path.
 | --- | --- | --- |
 | `llama.cpp` | Build `llama-server` with CUDA | Keep one server process running |
 | Qwen3-1.7B | Downloaded automatically on first server launch | Loaded from the local cache |
-| `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
+| openWakeWord | Install the pinned package and download the “Hey Jarvis” model | Scores short microphone frames locally on CPU while idle |
+| `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it after activation to transcribe the request |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
 | Piper | Install `piper-tts` and download one voice | Speaks the wake acknowledgement, action, information, and conversational responses on CPU |
 | Shelly outlets | Join Wi-Fi, name `lamp-1` and `lamp-2`, and reserve their IPs | Controlled directly over the local network |
@@ -122,11 +126,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python apartment_controller.py --download-wake-model
 ```
 
-The requirements install `requests`, NVIDIA's `Jetson.GPIO` package, and the
-local Piper text-to-speech package. This installation happens once, not each
-time the controller starts.
+The requirements install `requests`, NVIDIA's `Jetson.GPIO` package, Piper
+text-to-speech, and a pinned openWakeWord revision with current ARM64 LiteRT
+support. The final command downloads only the feature files and “Hey Jarvis”
+wake model needed by this project. Both steps happen once, not each time the
+controller starts. The included pretrained wake models are licensed for
+non-commercial use under CC BY-NC-SA 4.0.
 
 ### 4. Configure the Shelly outlets
 
@@ -262,7 +270,7 @@ The Qwen model does not require a separate manual download command. The first
 server launch with `-hf ggml-org/Qwen3-1.7B-GGUF:Q4_K_M` downloads and caches
 the Q4_K_M model. Later launches use the local cached copy. The 1.7B model is
 the default because it leaves more shared-memory and power headroom for
-continuous Whisper transcription and the desktop audio services.
+request transcription, wake detection, and the desktop audio services.
 
 ### 9. Build whisper.cpp for speech-to-text
 
@@ -509,42 +517,66 @@ source .venv/bin/activate
 python apartment_controller.py --listen --speak
 ```
 
-The default wake word is `command`. Use it in two stages:
+The default wake phrase is “Hey Jarvis.” Use it in two stages:
 
-1. Say “command.”
+1. Say “Hey Jarvis.”
 2. Wait for the spoken “What’s up?” response and the `Recording request...`
    message.
 3. Say “turn on my living room lamps.”
 
-The microphone remains open through one `arecord` process. Python continuously
-buffers local audio while Whisper examines overlapping two-second windows. When
-the wake word is detected, old buffered audio is discarded and a fresh
-five-second request is recorded. The microphone audio containing the spoken
-“What’s up?” response is discarded before recording begins. Only the post-wake
-request transcript enters the Qwen interpretation and validation path.
+The microphone remains open through one `arecord` process. While idle,
+openWakeWord evaluates 80 ms audio frames with its dedicated “Hey Jarvis” model
+on the CPU. It detects the phrase directly from audio, so a Whisper spelling
+such as “Hey Department” can no longer cause the activation to be missed.
+Whisper is not launched for idle audio.
+
+When the wake phrase score reaches the default `0.5` threshold, old buffered
+audio is discarded and a fresh five-second request is recorded. The microphone
+audio containing the spoken “What’s up?” response is also discarded before
+recording begins. Whisper transcribes only this post-activation request, and
+only that transcript enters the Qwen interpretation and validation path.
 
 After both outlets confirm an allowed action, Piper says either “Living room
 lamps turned on” or “Living room lamps turned off.” Device confirmations remain
 fixed Python responses, not conversational LLM output.
 
-Use a more distinctive wake phrase if `command` triggers too easily:
+If the phrase is still missed, lower the openWakeWord threshold slightly. Lower
+values make activation easier but can increase accidental activations:
 
 ```bash
 python apartment_controller.py \
   --listen \
   --speak \
-  --wake-word "hey apartment"
+  --wake-threshold 0.4
 ```
 
-For a non-default microphone or a longer wake-detection window:
+For a non-default microphone:
 
 ```bash
 python apartment_controller.py \
   --listen \
   --speak \
-  --microphone "onn USB Microphone" \
-  --wake-window-seconds 3
+  --microphone "onn USB Microphone"
 ```
+
+Add `--wake-debug` to print the highest model score seen every two seconds and
+the active threshold. This diagnostic mode does not save audio.
+
+The previous Whisper-based wake detector remains available as a fallback and
+supports a custom phrase:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --wake-engine whisper \
+  --wake-word "hey apartment" \
+  --wake-sensitivity high
+```
+
+With that fallback only, `--wake-sensitivity`, `--wake-window-seconds`, and
+custom `--wake-word` values have their previous meanings. The openWakeWord
+engine is fixed to its pretrained “Hey Jarvis” phrase.
 
 The controller automatically tries `paplay`, then `pw-play`, so the selected
 Linux system output is used for Bluetooth. It falls back to direct ALSA only if
@@ -597,9 +629,10 @@ Direct ALSA bypasses Linux system audio and can report `Device or resource busy`
 when the desktop audio service already owns the hardware. Prefer `--speaker`
 whenever the desired output appears in `--list-speakers`.
 
-Listen mode performs more Whisper inference than push-to-talk, so it keeps the
-Jetson busier. All audio and temporary transcripts remain local and are
-deleted after each check. Press Ctrl+C to stop.
+Listen mode still performs more work than push-to-talk, but the small dedicated
+wake model avoids running Whisper during silence. Audio stays local; temporary
+request recordings and transcripts are deleted after each request. Press
+Ctrl+C to stop.
 
 ### Time, date, and weather responses
 
@@ -705,9 +738,14 @@ python apartment_controller.py --help
 ```
 
 - `--voice` enables push-to-talk input.
-- `--listen` enables continuous listen mode with wake-word detection.
-- `--wake-word PHRASE` changes the default `command` wake phrase.
-- `--wake-window-seconds N` changes the wake-detection audio window.
+- `--listen` continuously listens locally for “Hey Jarvis.”
+- `--download-wake-model` downloads the “Hey Jarvis” model once, then exits.
+- `--wake-threshold N` tunes openWakeWord from above 0 through 1; lower values
+  activate more easily.
+- `--wake-debug` prints live openWakeWord peak scores and the trigger threshold.
+- `--wake-engine whisper` selects the previous transcription-based fallback.
+- `--wake-word PHRASE`, `--wake-window-seconds N`, and
+  `--wake-sensitivity {low,normal,high}` configure only the Whisper fallback.
 - `--speak` enables the local Piper wake acknowledgement, action, information,
   and conversational responses.
 - `--tts-model PATH` selects a different Piper ONNX voice model.
@@ -801,10 +839,25 @@ and try another USB port.
 
 ### Wake word is missed or triggers accidentally
 
-Speak the wake phrase by itself and wait for “What’s up?” before saying the
-apartment request. Try a distinctive phrase such as `hey apartment`, or increase
-`--wake-window-seconds` from 2 to 3. Push-to-talk mode remains available when
-continuous Whisper scanning uses too much GPU time.
+Speak “Hey Jarvis” by itself and wait for “What’s up?” before saying the
+apartment request. Add `--wake-debug` and watch the peak score while speaking.
+If the peak approaches but does not reach `0.5`, try `--wake-threshold 0.4`,
+then `0.35` if necessary. Raise the threshold if unrelated speech activates it.
+Confirm the selected microphone with `--list-microphones` and a playback test
+before replacing hardware.
+
+If openWakeWord cannot load, rerun:
+
+```bash
+source ~/apartment-ai/.venv/bin/activate
+python -m pip install -r ~/apartment-ai/requirements.txt
+cd ~/apartment-ai
+python apartment_controller.py --download-wake-model
+```
+
+The older detector is available with `--wake-engine whisper`; its
+`--wake-sensitivity`, `--wake-window-seconds`, and custom `--wake-word` options
+still work. Push-to-talk mode remains available with `--voice`.
 
 ### Piper model is missing or no speech is heard
 
@@ -896,6 +949,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 - [whisper.cpp documentation](https://github.com/ggml-org/whisper.cpp)
 - [whisper.cpp model downloads](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md)
 - [Piper local text-to-speech](https://github.com/OHF-Voice/piper1-gpl)
+- [openWakeWord](https://github.com/dscripka/openWakeWord)
 - [Open-Meteo forecast API](https://open-meteo.com/en/docs)
 - [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api)
 - [Open-Meteo data license](https://open-meteo.com/en/licence)
@@ -910,7 +964,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 ## Next milestones
 
 - Stop recording automatically when speech ends
-- Replace continuous Whisper scanning with a smaller dedicated wake-word model
+- Evaluate a custom apartment-specific wake model after real-room testing
 - Add optional multi-turn conversational memory
 - Home Assistant integration
 - Environmental and presence sensors

@@ -1,3 +1,5 @@
 requests>=2.31,<3
 Jetson.GPIO>=2.1,<3
 piper-tts>=1.4,<2
+# Newer than the 0.6.0 PyPI release so current ARM64/Python uses LiteRT.
+openwakeword @ git+https://github.com/dscripka/openWakeWord.git@368c03716d1e92591906a84949bc477f3a834455

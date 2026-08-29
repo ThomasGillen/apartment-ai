@@ -4,22 +4,24 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from apartment_controller import (
     AlsaAudioStream,
     ControllerError,
     GpioLed,
+    OpenWakeWordInput,
     OpenMeteoWeather,
     PiperSpeechOutput,
     ShellyOutlet,
     ShellyOutletGroup,
-    WakeWordInput,
+    WhisperWakeWordInput,
     WhisperVoiceInput,
     clean_conversation_response,
     create_device_output,
     current_date_response,
     current_time_response,
+    download_openwakeword_model,
     execute_request,
     generate_conversation_response,
     get_alsa_microphones,
@@ -365,10 +367,104 @@ class ContinuousAudioTests(unittest.TestCase):
         self.assertEqual(len(audio), 64000)
 
 
-class WakeWordInputTests(unittest.TestCase):
+class OpenWakeWordInputTests(unittest.TestCase):
+    def test_detects_hey_jarvis_then_uses_whisper_only_for_request(self):
+        stream = Mock()
+        stream.read_frame.side_effect = [b"quiet", b"hey jarvis"]
+        stream.read_seconds.return_value = b"request audio"
+        stream_factory = Mock(return_value=stream)
+        model = Mock()
+        model.predict.side_effect = [
+            {"hey jarvis": 0.12},
+            {"hey jarvis": 0.73},
+        ]
+        model_loader = Mock(return_value=model)
+        sample_converter = Mock(side_effect=lambda pcm: pcm)
+        voice = Mock(microphone="plughw:2,0", record_seconds=5)
+        voice.transcribe_pcm.return_value = "turn the living room lamps on"
+
+        wake_input = OpenWakeWordInput(
+            voice_input=voice,
+            threshold=0.5,
+            stream_factory=stream_factory,
+            model_loader=model_loader,
+            sample_converter=sample_converter,
+        )
+        transcript = wake_input.listen()
+
+        self.assertEqual(transcript, "turn the living room lamps on")
+        model_loader.assert_called_once_with(
+            wakeword_models=["hey jarvis"],
+            inference_framework="tflite",
+        )
+        stream_factory.assert_called_once_with(
+            microphone="plughw:2,0",
+            frame_ms=80,
+        )
+        self.assertEqual(model.predict.call_count, 2)
+        voice.transcribe_pcm.assert_called_once_with(
+            b"request audio",
+            prompt=ANY,
+            announce=True,
+        )
+
+    def test_says_acknowledgement_and_discards_speaker_audio(self):
+        stream = Mock()
+        stream.read_frame.return_value = b"wake"
+        stream.read_seconds.return_value = b"request"
+        model = Mock()
+        model.predict.return_value = {"hey_jarvis": 0.9}
+        voice = Mock(microphone=None, record_seconds=5)
+        voice.transcribe_pcm.return_value = "lights off"
+        speech_output = Mock()
+        wake_input = OpenWakeWordInput(
+            voice_input=voice,
+            speech_output=speech_output,
+            stream_factory=Mock(return_value=stream),
+            model_loader=Mock(return_value=model),
+            sample_converter=lambda pcm: pcm,
+        )
+
+        transcript = wake_input.listen()
+
+        self.assertEqual(transcript, "lights off")
+        speech_output.speak.assert_called_once_with("What's up?")
+        self.assertEqual(stream.discard_buffer.call_count, 2)
+
+    def test_resets_model_and_drops_stale_audio_before_next_request(self):
+        stream = Mock()
+        stream.read_frame.return_value = b"wake"
+        stream.read_seconds.return_value = b"request"
+        model = Mock()
+        model.predict.return_value = {"hey jarvis": 0.8}
+        voice = Mock(microphone=None, record_seconds=5)
+        voice.transcribe_pcm.return_value = "lights on"
+        wake_input = OpenWakeWordInput(
+            voice_input=voice,
+            stream_factory=Mock(return_value=stream),
+            model_loader=Mock(return_value=model),
+            sample_converter=lambda pcm: pcm,
+        )
+
+        wake_input.listen()
+        wake_input.listen()
+
+        model.reset.assert_called_once_with()
+        # One post-detection discard per request plus the stale buffer discard.
+        self.assertEqual(stream.discard_buffer.call_count, 3)
+
+    def test_downloads_only_the_hey_jarvis_model(self):
+        downloader = Mock()
+
+        download_openwakeword_model(downloader=downloader)
+
+        downloader.assert_called_once_with(model_names=["hey_jarvis"])
+
+
+class WhisperWakeWordInputTests(unittest.TestCase):
     def test_waits_for_whole_wake_word_then_records_command(self):
         stream = Mock()
-        stream.read_seconds.side_effect = [b"noise", b"wake", b"command"]
+        stream.read_seconds.side_effect = [b"command"]
         voice = Mock()
         voice.microphone = "plughw:2,0"
         voice.record_seconds = 5
@@ -378,11 +474,15 @@ class WakeWordInputTests(unittest.TestCase):
             "turn the living room lamps on",
         ]
         stream_factory = Mock(return_value=stream)
-        wake_input = WakeWordInput(
+        wake_input = WhisperWakeWordInput(
             voice_input=voice,
             wake_word="command",
             window_seconds=2,
             stream_factory=stream_factory,
+        )
+        wake_input.noise_floor = 10
+        wake_input._capture_wake_utterance = Mock(
+            side_effect=[b"noise", b"wake"]
         )
 
         transcript = wake_input.listen()
@@ -390,16 +490,16 @@ class WakeWordInputTests(unittest.TestCase):
         self.assertEqual(transcript, "turn the living room lamps on")
         self.assertEqual(
             [call.args[0] for call in stream.read_seconds.call_args_list],
-            [2, 2, 5],
+            [5],
         )
-        stream.discard_buffer.assert_called_once_with()
+        self.assertEqual(stream.discard_buffer.call_count, 2)
         command_call = voice.transcribe_pcm.call_args_list[-1]
         self.assertTrue(command_call.kwargs["prompt"])
         self.assertTrue(command_call.kwargs["announce"])
 
     def test_does_not_match_wake_word_inside_another_word(self):
         voice = Mock(microphone=None, record_seconds=5)
-        wake_input = WakeWordInput(
+        wake_input = WhisperWakeWordInput(
             voice_input=voice,
             wake_word="command",
             stream_factory=Mock(),
@@ -407,6 +507,52 @@ class WakeWordInputTests(unittest.TestCase):
 
         self.assertFalse(wake_input._contains_wake_word("commander reporting"))
         self.assertTrue(wake_input._contains_wake_word("Command, please"))
+        self.assertTrue(wake_input._contains_wake_word("commands"))
+        self.assertFalse(wake_input._contains_wake_word("common request"))
+
+    def test_captures_a_complete_speech_segment_after_adaptive_silence(self):
+        frame_samples = 1600
+
+        def pcm_frame(level):
+            return level.to_bytes(2, "little", signed=True) * frame_samples
+
+        silence = pcm_frame(10)
+        speech = pcm_frame(1000)
+        stream = Mock(frame_ms=100)
+        stream.read_frame.side_effect = (
+            [silence] * 3 + [speech] * 3 + [silence] * 5
+        )
+        voice = Mock(microphone=None, record_seconds=5)
+        wake_input = WhisperWakeWordInput(
+            voice_input=voice,
+            stream_factory=Mock(return_value=stream),
+        )
+        wake_input.noise_floor = 10
+
+        utterance = wake_input._capture_wake_utterance()
+
+        self.assertEqual(len(utterance), 11 * len(silence))
+
+    def test_calibration_uses_median_and_sensitivity_changes_trigger(self):
+        frame_samples = 1600
+
+        def pcm_frame(level):
+            return level.to_bytes(2, "little", signed=True) * frame_samples
+
+        stream = Mock(frame_ms=100)
+        stream.read_frame.side_effect = [pcm_frame(20)] * 9 + [pcm_frame(2000)]
+        voice = Mock(microphone=None, record_seconds=5)
+        wake_input = WhisperWakeWordInput(
+            voice_input=voice,
+            stream_factory=Mock(return_value=stream),
+        )
+
+        wake_input._calibrate_noise()
+        normal_threshold = wake_input._wake_energy_threshold()
+        wake_input.sensitivity = "high"
+
+        self.assertEqual(wake_input.noise_floor, 20)
+        self.assertLess(wake_input._wake_energy_threshold(), normal_threshold)
 
     def test_says_acknowledgement_then_discards_its_own_speaker_audio(self):
         stream = Mock()
@@ -414,11 +560,14 @@ class WakeWordInputTests(unittest.TestCase):
         voice = Mock(microphone=None, record_seconds=5)
         voice.transcribe_pcm.side_effect = ["command", "lights on"]
         speech_output = Mock()
-        wake_input = WakeWordInput(
+        wake_input = WhisperWakeWordInput(
             voice_input=voice,
+            wake_word="command",
             speech_output=speech_output,
             stream_factory=Mock(return_value=stream),
         )
+        wake_input.noise_floor = 10
+        wake_input._capture_wake_utterance = Mock(return_value=b"wake")
 
         transcript = wake_input.listen()
 
@@ -804,12 +953,44 @@ class ShellyOutletTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
-    def test_listen_enables_continuous_mode(self):
-        args = parse_args(["--listen", "--wake-word", "hey apartment"])
+    def test_listen_uses_openwakeword_hey_jarvis_by_default(self):
+        args = parse_args(["--listen"])
 
         self.assertTrue(args.listen)
         self.assertFalse(args.voice)
+        self.assertEqual(args.wake_engine, "openwakeword")
+        self.assertEqual(args.wake_word, "hey jarvis")
+        self.assertEqual(args.wake_threshold, 0.5)
+        self.assertEqual(args.wake_sensitivity, "normal")
+        self.assertFalse(args.wake_debug)
+
+    def test_accepts_whisper_fallback_custom_phrase_and_diagnostics(self):
+        args = parse_args(
+            [
+                "--listen",
+                "--wake-engine",
+                "whisper",
+                "--wake-word",
+                "hey apartment",
+                "--wake-sensitivity",
+                "high",
+                "--wake-debug",
+            ]
+        )
+
+        self.assertEqual(args.wake_engine, "whisper")
         self.assertEqual(args.wake_word, "hey apartment")
+        self.assertEqual(args.wake_sensitivity, "high")
+        self.assertTrue(args.wake_debug)
+
+    def test_rejects_custom_phrase_for_fixed_openwakeword_model(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            parse_args(["--listen", "--wake-word", "hey apartment"])
+
+    def test_accepts_custom_openwakeword_threshold(self):
+        args = parse_args(["--listen", "--wake-threshold", "0.35"])
+
+        self.assertEqual(args.wake_threshold, 0.35)
 
     def test_voice_and_listen_modes_are_mutually_exclusive(self):
         with patch("sys.stderr"), self.assertRaises(SystemExit):
@@ -887,6 +1068,14 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(main(["--list-audio"]), 0)
         speakers.assert_called_once_with()
         microphones.assert_called_once_with()
+
+    @patch("apartment_controller.download_openwakeword_model")
+    def test_wake_model_download_exits_before_hardware_initialization(
+        self,
+        download,
+    ):
+        self.assertEqual(main(["--download-wake-model"]), 0)
+        download.assert_called_once_with()
 
 
 if __name__ == "__main__":
