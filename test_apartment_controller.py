@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,36 +10,77 @@ from apartment_controller import (
     AlsaAudioStream,
     ControllerError,
     GpioLed,
+    OpenMeteoWeather,
     PiperSpeechOutput,
     WakeWordInput,
     WhisperVoiceInput,
+    clean_conversation_response,
+    current_date_response,
+    current_time_response,
+    execute_request,
+    generate_conversation_response,
     get_alsa_microphones,
     get_system_audio_sinks,
-    interpret_command,
+    interpret_request,
     main,
     parse_args,
     resolve_microphone,
     resolve_system_sink,
-    validate_command,
+    validate_request,
 )
 
 
-class CommandValidationTests(unittest.TestCase):
+class RequestValidationTests(unittest.TestCase):
     def test_allows_known_lamp_command(self):
         self.assertEqual(
-            validate_command({"device": "desk_lamp", "action": "on"}),
-            ("desk_lamp", "on"),
+            validate_request(
+                {"intent": "control", "device": "desk_lamp", "action": "on"}
+            ),
+            ("control", "desk_lamp", "on"),
         )
 
-    def test_rejects_unknown_device(self):
-        with self.assertRaisesRegex(ControllerError, "unknown device"):
-            validate_command({"device": "oven", "action": "on"})
+    def test_allows_non_control_intents(self):
+        for intent in ("time", "date", "weather", "conversation"):
+            with self.subTest(intent=intent):
+                self.assertEqual(
+                    validate_request({"intent": intent}),
+                    (intent, None, None),
+                )
 
-    def test_rejects_non_object_json(self):
-        with self.assertRaisesRegex(ControllerError, "JSON object"):
-            validate_command(["desk_lamp", "on"])
+    def test_normalizes_legacy_none_to_conversation(self):
+        self.assertEqual(
+            validate_request({"intent": "none"}),
+            ("conversation", None, None),
+        )
 
-    def test_interpret_command_posts_text_and_returns_valid_command(self):
+    def test_routes_unknown_device_and_action_to_conversation(self):
+        for request in (
+            {"intent": "control", "device": "oven", "action": "on"},
+            {
+                "intent": "control",
+                "device": "desk_lamp",
+                "action": "dim",
+            },
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    validate_request(request),
+                    ("conversation", None, None),
+                )
+
+    def test_routes_unknown_intent_to_conversation(self):
+        self.assertEqual(
+            validate_request({"intent": "unsupported"}),
+            ("conversation", None, None),
+        )
+
+    def test_routes_non_object_json_to_conversation(self):
+        self.assertEqual(
+            validate_request(["desk_lamp", "on"]),
+            ("conversation", None, None),
+        )
+
+    def test_interpret_request_posts_text_and_returns_valid_request(self):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
@@ -46,7 +88,11 @@ class CommandValidationTests(unittest.TestCase):
                 {
                     "message": {
                         "content": json.dumps(
-                            {"device": "desk_lamp", "action": "off"}
+                            {
+                                "intent": "control",
+                                "device": "desk_lamp",
+                                "action": "off",
+                            }
                         )
                     }
                 }
@@ -55,13 +101,206 @@ class CommandValidationTests(unittest.TestCase):
         client = Mock()
         client.post.return_value = response
 
-        result = interpret_command(
+        result = interpret_request(
             "turn it off", "http://localhost/test", http_client=client
         )
 
-        self.assertEqual(result, ("desk_lamp", "off"))
+        self.assertEqual(result, ("control", "desk_lamp", "off"))
         request_body = client.post.call_args.kwargs["json"]
         self.assertEqual(request_body["messages"][-1]["content"], "turn it off")
+
+    def test_invalid_classifier_json_uses_conversation_fallback(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": "not JSON"}}]
+        }
+        client = Mock()
+        client.post.return_value = response
+
+        result = interpret_request(
+            "How long does laundry take?",
+            "http://localhost/test",
+            http_client=client,
+        )
+
+        self.assertEqual(result, ("conversation", None, None))
+
+
+class ConversationResponseTests(unittest.TestCase):
+    @staticmethod
+    def response_with(content):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": content}}]
+        }
+        return response
+
+    def test_generates_short_clean_response(self):
+        client = Mock()
+        client.post.return_value = self.response_with(
+            "<think>Private reasoning.</think>\n**Frank Herbert** wrote Dune."
+        )
+
+        result = generate_conversation_response(
+            "Who wrote Dune?",
+            "http://localhost/test",
+            http_client=client,
+        )
+
+        self.assertEqual(result, "Frank Herbert wrote Dune.")
+        request_body = client.post.call_args.kwargs["json"]
+        self.assertIn("/no_think", request_body["messages"][-1]["content"])
+        self.assertIn(
+            "do not imply that the action happened",
+            request_body["messages"][0]["content"],
+        )
+        self.assertEqual(request_body["max_tokens"], 160)
+
+    def test_limits_response_to_two_sentences(self):
+        result = clean_conversation_response(
+            "First sentence. Second sentence! Third sentence?"
+        )
+
+        self.assertEqual(result, "First sentence. Second sentence!")
+
+    def test_rejects_empty_response_after_thinking_is_removed(self):
+        with self.assertRaisesRegex(ControllerError, "empty conversational"):
+            clean_conversation_response("<think>Only hidden reasoning.</think>")
+
+
+class InformationResponseTests(unittest.TestCase):
+    def test_formats_local_time_and_date(self):
+        now = datetime(2026, 8, 27, 9, 5)
+
+        self.assertEqual(current_time_response(now), "It is 9:05 AM.")
+        self.assertEqual(
+            current_date_response(now),
+            "Today is Thursday, August 27, 2026.",
+        )
+
+    def test_executes_information_without_touching_gpio(self):
+        output = Mock()
+        weather = Mock()
+        weather.current_response.return_value = "Weather response."
+        now = datetime(2026, 8, 27, 21, 15)
+
+        self.assertEqual(
+            execute_request(("time", None, None), output, weather, now=now),
+            "It is 9:15 PM.",
+        )
+        self.assertEqual(
+            execute_request(("weather", None, None), output, weather, now=now),
+            "Weather response.",
+        )
+        output.apply.assert_not_called()
+
+    def test_executes_control_through_device_output(self):
+        output = Mock()
+        output.apply.return_value = "Desk lamp turned on."
+
+        response = execute_request(
+            ("control", "desk_lamp", "on"),
+            output,
+            Mock(),
+        )
+
+        self.assertEqual(response, "Desk lamp turned on.")
+        output.apply.assert_called_once_with("desk_lamp", "on")
+
+    def test_executes_conversation_without_touching_gpio(self):
+        output = Mock()
+        client = Mock()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [
+                {"message": {"content": "Dune was written by Frank Herbert."}}
+            ]
+        }
+        client.post.return_value = response
+
+        result = execute_request(
+            ("conversation", None, None),
+            output,
+            Mock(),
+            user_text="Who wrote Dune?",
+            conversation_client=client,
+        )
+
+        self.assertEqual(result, "Dune was written by Frank Herbert.")
+        output.apply.assert_not_called()
+
+class WeatherResponseTests(unittest.TestCase):
+    def test_builds_current_weather_response_from_location(self):
+        location_response = Mock()
+        location_response.raise_for_status.return_value = None
+        location_response.json.return_value = {
+            "results": [
+                {
+                    "name": "Boston",
+                    "admin1": "Massachusetts",
+                    "latitude": 42.36,
+                    "longitude": -71.06,
+                }
+            ]
+        }
+        forecast_response = Mock()
+        forecast_response.raise_for_status.return_value = None
+        forecast_response.json.return_value = {
+            "current": {
+                "temperature_2m": 72.4,
+                "apparent_temperature": 75.6,
+                "weather_code": 2,
+            },
+            "daily": {
+                "temperature_2m_max": [78.2],
+                "temperature_2m_min": [61.4],
+                "precipitation_probability_max": [20],
+            },
+        }
+        client = Mock()
+        client.get.side_effect = [location_response, forecast_response]
+        weather = OpenMeteoWeather("Boston, MA", http_client=client)
+
+        response = weather.current_response()
+
+        self.assertEqual(
+            response,
+            "In Boston, Massachusetts, it is 72 degrees Fahrenheit with partly "
+            "cloudy skies. Today's high is 78 and the low is 61, with a 20 "
+            "percent chance of precipitation. It feels like 76 degrees.",
+        )
+        self.assertEqual(client.get.call_count, 2)
+        forecast_params = client.get.call_args_list[1].kwargs["params"]
+        self.assertEqual(forecast_params["temperature_unit"], "fahrenheit")
+        self.assertEqual(forecast_params["forecast_days"], 1)
+
+    def test_requires_a_configured_weather_location(self):
+        weather = OpenMeteoWeather()
+
+        with self.assertRaisesRegex(ControllerError, "--weather-location"):
+            weather.current_response()
+
+    def test_reports_location_that_cannot_be_found(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": []}
+        client = Mock()
+        client.get.return_value = response
+        weather = OpenMeteoWeather("Not A Real City", http_client=client)
+
+        with self.assertRaisesRegex(ControllerError, "not found"):
+            weather.current_response()
+
+    def test_reports_weather_network_failure(self):
+        client = Mock()
+        client.get.side_effect = TimeoutError("offline")
+        weather = OpenMeteoWeather("Boston, MA", http_client=client)
+
+        with self.assertRaisesRegex(ControllerError, "Could not look up"):
+            weather.current_response()
 
 
 class VoiceInputTests(unittest.TestCase):
@@ -480,6 +719,11 @@ class CommandLineTests(unittest.TestCase):
 
         self.assertEqual(args.speaker, "Living Room Speaker")
         self.assertIsNone(args.speaker_device)
+
+    def test_accepts_weather_location(self):
+        args = parse_args(["--weather-location", "Boston, MA"])
+
+        self.assertEqual(args.weather_location, "Boston, MA")
 
     @patch("apartment_controller.print_available_speakers")
     def test_speaker_listing_exits_before_hardware_initialization(self, listing):

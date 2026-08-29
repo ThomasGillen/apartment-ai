@@ -1,12 +1,15 @@
 # Apartment AI
 
-A fully local apartment automation project for an NVIDIA Jetson Orin Nano. A
-microphone command is transcribed by `whisper.cpp`, interpreted by Qwen running
-through `llama.cpp`, validated by Python, and represented by a breadboard LED on
-Jetson GPIO.
+A local-first apartment automation project for an NVIDIA Jetson Orin Nano. A
+spoken request is transcribed by `whisper.cpp`, classified by Qwen running
+through `llama.cpp`, validated by Python, and handled as a device control, a
+time/date/weather response, or a short local conversational response.
 
-No microphone audio, transcript, or apartment command is sent to a cloud API.
-Internet access is only needed during initial package and model downloads.
+No microphone audio, transcript, or apartment request is sent to a cloud API.
+Time and date remain fully local. A weather request sends only the configured
+place name and resolved coordinates to Open-Meteo; it therefore needs internet
+access. Internet is otherwise needed only for initial package and model
+downloads.
 
 ## Architecture
 
@@ -17,19 +20,19 @@ ALSA arecord → temporary 16 kHz mono WAV
     ↓
 whisper.cpp → transcript
     ↓
-Qwen3-1.7B on llama.cpp → JSON device command
+Qwen3-1.7B on llama.cpp → JSON request intent
     ↓
 Python allow-list validation
-    ↓
-Jetson GPIO physical pin 7
-    ↓
-LED standing in for desk_lamp
-    ↓
-Piper confirmation → Linux system audio → speaker
+    ├─ control → Jetson GPIO → LED standing in for desk_lamp
+    ├─ time/date → Jetson system clock
+    ├─ weather → Open-Meteo using the configured location
+    └─ every other request → Qwen3-1.7B → short sanitized text
+                              ↓
+        response → Piper → Linux system audio → speaker
 ```
 
-The LLM never accesses GPIO directly. Voice and typed commands both enter the
-same validation and output path.
+The LLM never accesses GPIO, the system clock, or the weather service directly.
+Voice and typed requests both enter the same validation and response path.
 
 ## One-time setup versus daily use
 
@@ -39,7 +42,8 @@ same validation and output path.
 | Qwen3-1.7B | Downloaded automatically on first server launch | Loaded from the local cache |
 | `whisper.cpp` | Build `whisper-cli` with CUDA | Python launches it for recordings and wake-word checks |
 | Whisper model | Download `ggml-base.en.bin` once | Loaded locally for transcription |
-| Piper | Install `piper-tts` and download one voice | Speaks fixed ready/action responses on CPU |
+| Piper | Install `piper-tts` and download one voice | Speaks ready, action, information, and conversational responses on CPU |
+| Open-Meteo | No account or API key for personal use | Queried only for a weather request |
 | Python project | Create `.venv` and install requirements | Run push-to-talk or continuous listen mode |
 
 After setup, normal operation still uses only two terminals: one for
@@ -355,8 +359,9 @@ source .venv/bin/activate
 python -m unittest -v
 ```
 
-These tests simulate the voice and LLM boundaries. They do not record from the
-real microphone or change GPIO.
+These tests simulate the voice, LLM classification, conversational response,
+clock, and weather boundaries. They do not record from the real microphone,
+contact the live weather service, or change GPIO.
 
 ## Daily operation
 
@@ -381,7 +386,7 @@ Leave this terminal running. The first launch needs internet access while Qwen
 is downloaded; subsequent launches use the cached model. Do not add `-ngl 99`:
 current llama.cpp automatically chooses how many layers fit on the GPU, while a
 manual value disables that fitting. The controller needs only one server slot,
-and its short JSON commands do not need a large context or batch buffer.
+and its short JSON requests do not need a large context or batch buffer.
 
 ### Terminal 2 option A: push-to-talk mode
 
@@ -396,13 +401,13 @@ python apartment_controller.py --voice
 The prompt shows:
 
 ```text
-Press Enter to speak, type a command, or type 'quit':
+Press Enter to speak, type a request, or type 'quit':
 ```
 
-Press Enter, then say a short command such as “turn on my desk lamp.” The
+Press Enter, then say a short request such as “turn on my desk lamp.” The
 controller records for five seconds, transcribes the audio locally, displays
 what it heard, sends the transcript to Qwen, validates Qwen's JSON response, and
-changes the LED only if the command is allowed.
+changes the LED only if the control request is allowed.
 
 For a non-default microphone:
 
@@ -421,7 +426,7 @@ To use a seven-second recording window:
 python apartment_controller.py --voice --record-seconds 7
 ```
 
-Typing text at the voice prompt bypasses recording for that command. Type
+Typing text at the voice prompt bypasses recording for that request. Type
 `exit` or `quit`, or press Ctrl+C, to stop. The cleanup path leaves the LED off.
 
 ### Terminal 2 option B: continuous listen mode
@@ -438,18 +443,19 @@ python apartment_controller.py --listen --speak
 The default wake word is `command`. Use it in two stages:
 
 1. Say “command.”
-2. Wait for the spoken “Ready” response and the `Recording command...` message.
+2. Wait for the spoken “Ready” response and the `Recording request...` message.
 3. Say “turn on my desk lamp.”
 
 The microphone remains open through one `arecord` process. Python continuously
 buffers local audio while Whisper examines overlapping two-second windows. When
 the wake word is detected, old buffered audio is discarded and a fresh
-five-second command is recorded. The microphone audio containing the spoken
+five-second request is recorded. The microphone audio containing the spoken
 “Ready” response is discarded before recording begins. Only the post-wake
-command transcript enters the Qwen interpretation, validation, and GPIO path.
+request transcript enters the Qwen interpretation and validation path.
 
 After an allowed GPIO action succeeds, Piper says either “Desk lamp turned on”
-or “Desk lamp turned off.” These are fixed Python responses, not raw LLM output.
+or “Desk lamp turned off.” Device confirmations remain fixed Python responses,
+not conversational LLM output.
 
 Use a more distinctive wake phrase if `command` triggers too easily:
 
@@ -525,6 +531,68 @@ Listen mode performs more Whisper inference than push-to-talk, so it keeps the
 Jetson busier. All audio and temporary transcripts remain local and are
 deleted after each check. Press Ctrl+C to stop.
 
+### Time, date, and weather responses
+
+Information requests work in text, push-to-talk, and continuous listen modes.
+For example, after the wake word and ready response, say:
+
+```text
+What time is it?
+What is today's date?
+What is the weather?
+```
+
+Time and date use the Jetson's local system clock and require no additional
+option. Weather needs a configured city or postal code:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --weather-location "Boston, MA"
+```
+
+Include a state or country when a city name is ambiguous. The first weather
+request resolves that name to coordinates; later requests during the same run
+reuse the result. Each weather response includes current conditions, current
+temperature, today's high and low, and maximum precipitation probability in
+Fahrenheit and percent. No API key is required for personal use.
+
+Weather results are displayed with an Open-Meteo attribution line. Open-Meteo
+API data is provided under the CC BY 4.0 license; the attribution is displayed
+in the terminal but is not read aloud by Piper.
+
+For these information requests, the LLM selects only the request type. Python
+reads the clock and builds the weather sentence, so the LLM cannot invent the
+reported time or temperature.
+
+### Conversational fallback
+
+If a request is an ordinary question rather than a configured command or live
+information request, the controller asks the same local Qwen server for a short
+answer. For example:
+
+```text
+Who wrote Dune?
+Tell me a short joke.
+Why is the sky blue?
+How long does a washing machine usually run?
+```
+
+The conversational answer is limited to two short sentences, stripped of
+thinking blocks and common Markdown formatting, displayed in the terminal, and
+spoken when `--speak` is enabled. This adds a second sequential LLM request, so
+it can respond a little more slowly than a lamp, time, date, or weather request.
+
+Conversation is the catch-all fallback, including for apartment or appliance
+questions and requests the classifier cannot match to a dedicated handler. It
+is currently one request at a time; previous exchanges are not kept as chat
+history. Qwen has no live internet access. Current time, date, and weather still
+use their dedicated Python handlers. If an unconfigured control request reaches
+the conversational path, Qwen is instructed to say it cannot perform that
+action and never to imply it happened. Treat general factual answers as
+unverified local model output.
+
 ### Text-only mode
 
 The original text input remains available:
@@ -535,19 +603,26 @@ source .venv/bin/activate
 python apartment_controller.py
 ```
 
-## Command safety
+## Request safety
 
-The only allowed device/action pairs are:
+The only allowed request intents are:
 
 ```text
-desk_lamp → on
-desk_lamp → off
-none      → none
+control → desk_lamp → on
+control → desk_lamp → off
+time
+date
+weather
+conversation
 ```
 
-Malformed JSON, unknown devices, invalid actions, microphone failures,
-transcription failures, and LLM connection errors are rejected without changing
-GPIO. The LED is also forced off during normal controller shutdown.
+Only the exact allow-listed desk-lamp control shapes can enter the GPIO output
+path. Invalid classifier JSON, non-object results, unknown intents, unknown
+devices, invalid actions, and the legacy `none` intent all route to
+conversation instead. Microphone, transcription, LLM connection, and malformed
+server-envelope errors stop the request without changing GPIO. Time, date,
+weather, and conversation cannot enter the output path, and the LED is forced
+off during normal controller shutdown.
 
 ## Useful options
 
@@ -559,7 +634,8 @@ python apartment_controller.py --help
 - `--listen` enables continuous listen mode with wake-word detection.
 - `--wake-word PHRASE` changes the default `command` wake phrase.
 - `--wake-window-seconds N` changes the wake-detection audio window.
-- `--speak` enables local Piper ready and action responses.
+- `--speak` enables local Piper ready, action, information, and conversational
+  responses.
 - `--tts-model PATH` selects a different Piper ONNX voice model.
 - `--list-speakers` lists wired and Bluetooth system-audio outputs, then exits.
 - `--speaker NAME` selects a system speaker by description, sink ID, or index.
@@ -572,6 +648,7 @@ python apartment_controller.py --help
 - `--whisper-bin PATH` selects a different `whisper-cli` executable.
 - `--whisper-model PATH` selects a different Whisper model.
 - `--llm-url URL` selects a different chat-completions endpoint.
+- `--weather-location PLACE` selects the city or postal code used for weather.
 - `--led-pin N` changes the physical BOARD pin used for the LED.
 
 ## Troubleshooting
@@ -648,7 +725,7 @@ and try another USB port.
 ### Wake word is missed or triggers accidentally
 
 Speak the wake phrase by itself and wait for the ready message before saying the
-apartment command. Try a distinctive phrase such as `hey apartment`, or increase
+apartment request. Try a distinctive phrase such as `hey apartment`, or increase
 `--wake-window-seconds` from 2 to 3. Push-to-talk mode remains available when
 continuous Whisper scanning uses too much GPU time.
 
@@ -660,6 +737,36 @@ test the chosen sink with `--speaker`. For a Bluetooth speaker, also test the
 generated file with `paplay tts-test.wav`. Bluetooth outputs often do not appear
 in `aplay -l`; reserve `--speaker-device` for a headless direct-ALSA setup where
 Linux system audio is not already using the hardware.
+
+### Time or date is wrong
+
+Time and date responses use the Jetson's system clock. Check its time, time zone,
+and network synchronization:
+
+```bash
+timedatectl status
+sudo timedatectl set-timezone America/New_York
+sudo timedatectl set-ntp true
+```
+
+Replace `America/New_York` with the correct time zone. Wait until `timedatectl`
+reports that the system clock is synchronized before testing another response.
+
+### Weather is unavailable or uses the wrong place
+
+Start the controller with a specific location, including a state or country when
+needed:
+
+```bash
+python apartment_controller.py \
+  --listen \
+  --speak \
+  --weather-location "Boston, MA"
+```
+
+Weather requires an internet connection. A missing location, failed location
+match, network timeout, or unexpected service response is rejected without
+changing GPIO. Restart the controller after changing the location.
 
 ### GPIO permission error
 
@@ -683,9 +790,13 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 - [llama.cpp CUDA build documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
 - [llama-server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 - [Qwen3-1.7B GGUF model](https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF)
+- [Qwen3 thinking-mode controls](https://huggingface.co/Qwen/Qwen3-32B-GGUF)
 - [whisper.cpp documentation](https://github.com/ggml-org/whisper.cpp)
 - [whisper.cpp model downloads](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md)
 - [Piper local text-to-speech](https://github.com/OHF-Voice/piper1-gpl)
+- [Open-Meteo forecast API](https://open-meteo.com/en/docs)
+- [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api)
+- [Open-Meteo data license](https://open-meteo.com/en/licence)
 - [NVIDIA Jetson.GPIO setup](https://github.com/NVIDIA/jetson-gpio)
 - [NVIDIA JetPack 7.2.1 release information](https://developer.nvidia.com/embedded/jetpack/downloads)
 - [NVIDIA Jetson-IO documentation for Jetson Linux 39.2](https://docs.nvidia.com/jetson/archives/r39.2/DeveloperGuide/HR/ConfiguringTheJetsonExpansionHeaders.html)
@@ -695,7 +806,7 @@ The controller expects the OpenAI-compatible chat-completions endpoint at
 
 - Stop recording automatically when speech ends
 - Replace continuous Whisper scanning with a smaller dedicated wake-word model
-- Add optional conversational responses beyond fixed confirmations
+- Add optional multi-turn conversational memory
 - Home Assistant integration
 - Smart plugs and multiple lights
 - Environmental and presence sensors

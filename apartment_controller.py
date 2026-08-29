@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import wave
+from datetime import datetime
 from pathlib import Path
 
 
@@ -18,43 +19,77 @@ DEFAULT_WHISPER_MODEL = "~/whisper.cpp/models/ggml-base.en.bin"
 DEFAULT_WAKE_WORD = "command"
 DEFAULT_WAKE_WINDOW_SECONDS = 2
 DEFAULT_TTS_MODEL = "~/apartment-ai/voices/en_US-lessac-medium.onnx"
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ATTRIBUTION = "Weather data by Open-Meteo: https://open-meteo.com/"
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH = 2
-WHISPER_COMMAND_PROMPT = (
-    "A spoken apartment command, such as turn the desk lamp on or off."
+WHISPER_REQUEST_PROMPT = (
+    "A spoken apartment request or general question, such as turn the desk "
+    "lamp on, ask for the time or date, ask about the weather, or ask a "
+    "short conversational question."
 )
 
 SYSTEM_PROMPT = """
-You control an apartment.
+Classify one apartment request.
 
 Available devices:
 - desk_lamp
-- none
 
-Available actions:
+Available control actions:
 - on
 - off
-- none
 
-Interpret the user's request.
+Return exactly one of these JSON shapes:
+{"intent":"control","device":"desk_lamp","action":"on"}
+{"intent":"control","device":"desk_lamp","action":"off"}
+{"intent":"time"}
+{"intent":"date"}
+{"intent":"weather"}
+{"intent":"conversation"}
 
-If the user is not asking to control a device, return:
-{"device":"none","action":"none"}
+Use time for the current local time.
+Use date for the current calendar date.
+Use weather for current outdoor weather or today's forecast.
+Use conversation for EVERY other input, including ordinary questions, unclear
+phrases, questions about apartments or appliances, and requests to control a
+device or action that is not available. A question about a device is not a
+control request unless the user is explicitly asking to change its state.
+Never substitute an available device for an unsupported one.
 
-Return ONLY JSON.
+Return ONLY JSON with no extra keys or explanation.
 
 Examples:
-{"device":"desk_lamp","action":"on"}
-{"device":"desk_lamp","action":"off"}
-{"device":"none","action":"none"}
+Turn on the lamp -> {"intent":"control","device":"desk_lamp","action":"on"}
+What time is it? -> {"intent":"time"}
+What day is it? -> {"intent":"date"}
+What is the weather? -> {"intent":"weather"}
+Tell me a joke -> {"intent":"conversation"}
+Who wrote Dune? -> {"intent":"conversation"}
+How long does a washing machine usually run? -> {"intent":"conversation"}
+Turn on the oven -> {"intent":"conversation"}
 """
 
-ALLOWED_COMMANDS = {
+CONVERSATION_SYSTEM_PROMPT = """
+You are a concise voice assistant running locally in an apartment.
+Answer the user's message directly in no more than two short sentences.
+Return plain text only, suitable for text-to-speech: no Markdown, lists, JSON,
+or analysis. If the answer requires live information you do not have, briefly
+say that. Never claim to have controlled a device; device actions are handled
+by a separate validated path. Only desk_lamp on and off are configured. If a
+request to control anything else reaches you, say briefly that you cannot
+control it and do not imply that the action happened.
+/no_think
+"""
+
+ALLOWED_CONTROL_COMMANDS = {
     "desk_lamp": {"on", "off"},
-    "none": {"none"},
 }
+INFORMATION_INTENTS = {"time", "date", "weather"}
+NON_CONTROL_INTENTS = INFORMATION_INTENTS | {"conversation"}
+MAX_CONVERSATION_CHARACTERS = 320
 
 
 class ControllerError(RuntimeError):
@@ -190,7 +225,7 @@ class AlsaAudioStream:
 
 
 class WhisperVoiceInput:
-    """Record a short command with ALSA and transcribe it with whisper.cpp."""
+    """Record a short request with ALSA and transcribe it with whisper.cpp."""
 
     def __init__(
         self,
@@ -229,7 +264,7 @@ class WhisperVoiceInput:
         duration = record_seconds or self.record_seconds
         with tempfile.TemporaryDirectory(prefix="apartment-voice-") as temp_dir:
             temp_path = Path(temp_dir)
-            recording_path = temp_path / "command.wav"
+            recording_path = temp_path / "request.wav"
             transcript_path = temp_path / "transcript"
 
             record_command = [
@@ -261,7 +296,7 @@ class WhisperVoiceInput:
             return self._transcribe(
                 recording_path,
                 transcript_path,
-                prompt=WHISPER_COMMAND_PROMPT,
+                prompt=WHISPER_REQUEST_PROMPT,
             )
 
     def transcribe_pcm(self, pcm_audio, prompt=None, announce=False):
@@ -779,7 +814,7 @@ class PiperSpeechOutput:
 
 
 class WakeWordInput:
-    """Scan a continuous microphone stream, then capture a command on wake."""
+    """Scan a continuous microphone stream, then capture a request on wake."""
 
     def __init__(
         self,
@@ -804,7 +839,7 @@ class WakeWordInput:
     def listen(self):
         self.stream.start()
         if self.announced:
-            # Audio captured while the previous command was interpreted is stale.
+            # Audio captured while the previous request was handled is stale.
             self.stream.discard_buffer()
         if not self.announced:
             print(
@@ -837,19 +872,19 @@ class WakeWordInput:
             print(f'\aWake word detected in: "{wake_transcript}"')
             if self.speech_output is not None:
                 self.speech_output.speak("Ready.")
-                # Prevent the spoken response from entering the command audio.
+                # Prevent the spoken response from entering the request audio.
                 self.stream.discard_buffer()
 
             print(
-                f"Recording command for {self.voice_input.record_seconds} "
+                f"Recording request for {self.voice_input.record_seconds} "
                 "seconds... speak now."
             )
-            command_audio = self.stream.read_seconds(
+            request_audio = self.stream.read_seconds(
                 self.voice_input.record_seconds
             )
             transcript = self.voice_input.transcribe_pcm(
-                command_audio,
-                prompt=WHISPER_COMMAND_PROMPT,
+                request_audio,
+                prompt=WHISPER_REQUEST_PROMPT,
                 announce=True,
             )
 
@@ -874,6 +909,176 @@ class WakeWordInput:
         self.stream.close()
 
 
+WEATHER_CODE_DESCRIPTIONS = {
+    0: "clear skies",
+    1: "mainly clear skies",
+    2: "partly cloudy skies",
+    3: "overcast skies",
+    45: "fog",
+    48: "freezing fog",
+    51: "light drizzle",
+    53: "drizzle",
+    55: "heavy drizzle",
+    56: "light freezing drizzle",
+    57: "freezing drizzle",
+    61: "light rain",
+    63: "rain",
+    65: "heavy rain",
+    66: "light freezing rain",
+    67: "freezing rain",
+    71: "light snow",
+    73: "snow",
+    75: "heavy snow",
+    77: "snow grains",
+    80: "light rain showers",
+    81: "rain showers",
+    82: "heavy rain showers",
+    85: "light snow showers",
+    86: "heavy snow showers",
+    95: "thunderstorms",
+    96: "thunderstorms with light hail",
+    99: "thunderstorms with heavy hail",
+}
+
+
+def current_time_response(now=None):
+    current = now or datetime.now()
+    return f"It is {current.strftime('%I:%M %p').lstrip('0')}."
+
+
+def current_date_response(now=None):
+    current = now or datetime.now()
+    date_text = current.strftime("%A, %B %d, %Y").replace(" 0", " ")
+    return f"Today is {date_text}."
+
+
+class OpenMeteoWeather:
+    """Fetch current conditions for one configured location on demand."""
+
+    def __init__(self, location=None, http_client=None):
+        self.location = location.strip() if location else None
+        self.http_client = http_client
+        self.resolved_location = None
+
+    def current_response(self):
+        location = self._resolve_location()
+        weather = self._request_json(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+                "current": (
+                    "temperature_2m,apparent_temperature,weather_code"
+                ),
+                "daily": (
+                    "temperature_2m_max,temperature_2m_min,"
+                    "precipitation_probability_max"
+                ),
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+                "forecast_days": 1,
+            },
+            error_prefix="Could not get current weather",
+        )
+
+        try:
+            current = weather["current"]
+            daily = weather["daily"]
+            temperature = round(float(current["temperature_2m"]))
+            apparent = round(float(current["apparent_temperature"]))
+            weather_code = int(current["weather_code"])
+            high = round(float(daily["temperature_2m_max"][0]))
+            low = round(float(daily["temperature_2m_min"][0]))
+            precipitation = round(
+                float(daily["precipitation_probability_max"][0])
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise ControllerError(
+                "Weather service returned an unexpected response."
+            ) from error
+
+        description = WEATHER_CODE_DESCRIPTIONS.get(
+            weather_code,
+            "unclassified conditions",
+        )
+        response = (
+            f"In {location['label']}, it is {temperature} degrees Fahrenheit "
+            f"with {description}. Today's high is {high} and the low is {low}, "
+            f"with a {precipitation} percent chance of precipitation."
+        )
+        if abs(apparent - temperature) >= 3:
+            response += f" It feels like {apparent} degrees."
+        return response
+
+    def _resolve_location(self):
+        if self.resolved_location is not None:
+            return self.resolved_location
+        if not self.location:
+            raise ControllerError(
+                "Weather location is not configured. Start with "
+                '--weather-location "City, State".'
+            )
+
+        result = self._request_json(
+            OPEN_METEO_GEOCODING_URL,
+            params={
+                "name": self.location,
+                "count": 1,
+                "language": "en",
+                "format": "json",
+            },
+            error_prefix="Could not look up weather location",
+        )
+        locations = result.get("results")
+        if not isinstance(locations, list) or not locations:
+            raise ControllerError(
+                f'Weather location not found: "{self.location}". Try a city '
+                "with its state or country."
+            )
+
+        selected = locations[0]
+        try:
+            latitude = float(selected["latitude"])
+            longitude = float(selected["longitude"])
+            name = str(selected["name"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ControllerError(
+                "Weather location service returned an unexpected response."
+            ) from error
+
+        admin_area = str(selected.get("admin1") or "")
+        label = name
+        if admin_area and admin_area.casefold() != name.casefold():
+            label = f"{name}, {admin_area}"
+        self.resolved_location = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "label": label,
+        }
+        return self.resolved_location
+
+    def _request_json(self, url, params, error_prefix):
+        client = self.http_client
+        if client is None:
+            try:
+                import requests
+            except ImportError as error:
+                raise ControllerError(
+                    "The 'requests' package is not installed in this environment."
+                ) from error
+            client = requests
+
+        try:
+            response = client.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as error:
+            raise ControllerError(f"{error_prefix}: {error}") from error
+        if not isinstance(payload, dict):
+            raise ControllerError(f"{error_prefix}: unexpected response")
+        return payload
+
+
 class GpioLed:
     def __init__(self, pin):
         try:
@@ -891,10 +1096,6 @@ class GpioLed:
         self.gpio.setup(self.pin, self.gpio.OUT, initial=self.gpio.LOW)
 
     def apply(self, device, action):
-        if device == "none":
-            print("No apartment action requested.\n")
-            return None
-
         if device != "desk_lamp":
             raise ControllerError(f"No output is configured for device: {device}")
 
@@ -914,7 +1115,7 @@ class GpioLed:
         self.gpio.cleanup()
 
 
-def interpret_command(user_text, llm_url=DEFAULT_LLM_URL, http_client=None):
+def interpret_request(user_text, llm_url=DEFAULT_LLM_URL, http_client=None):
     if http_client is None:
         try:
             import requests
@@ -949,39 +1150,185 @@ def interpret_command(user_text, llm_url=DEFAULT_LLM_URL, http_client=None):
     print(response_text)
 
     try:
-        command = json.loads(response_text)
-    except (json.JSONDecodeError, TypeError) as error:
-        raise ControllerError("Invalid JSON from LLM.") from error
+        request = json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        print("Classifier response was not valid JSON; using conversation fallback.")
+        return "conversation", None, None
 
-    return validate_command(command)
-
-
-def validate_command(command):
-    if not isinstance(command, dict):
-        raise ControllerError("LLM command must be a JSON object.")
-
-    device = command.get("device")
-    action = command.get("action")
-
-    if device not in ALLOWED_COMMANDS:
-        raise ControllerError(f"Rejected unknown device: {device}")
-
-    if action not in ALLOWED_COMMANDS[device]:
-        raise ControllerError(f"Rejected invalid command: {device} -> {action}")
-
-    print(f"Validated command: {device} -> {action}")
-    return device, action
+    return validate_request(request)
 
 
-def read_command(voice_input=None, wake_input=None):
+def clean_conversation_response(response_text):
+    if not isinstance(response_text, str):
+        raise ControllerError(
+            "Unexpected conversational response from LLM server."
+        )
+
+    # Qwen's soft /no_think switch can still produce an empty thinking block,
+    # so remove both complete and truncated blocks before speech output.
+    response_text = re.sub(
+        r"<think>.*?</think>",
+        " ",
+        response_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    response_text = re.sub(
+        r"<think>.*$",
+        " ",
+        response_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    response_text = re.sub(
+        r"</?think>",
+        " ",
+        response_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove common Markdown presentation syntax because Piper should receive
+    # natural spoken text rather than headings, bullets, or formatting marks.
+    response_text = re.sub(
+        r"(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)",
+        "",
+        response_text,
+    )
+    response_text = response_text.replace("```", "").replace("`", "")
+    response_text = response_text.replace("**", "").replace("__", "")
+    response_text = " ".join(response_text.split())
+
+    if not response_text:
+        raise ControllerError("The LLM returned an empty conversational response.")
+
+    sentences = re.split(r"(?<=[.!?])\s+", response_text)
+    response_text = " ".join(sentences[:2])
+    if len(response_text) > MAX_CONVERSATION_CHARACTERS:
+        clipped = response_text[: MAX_CONVERSATION_CHARACTERS - 3]
+        if " " in clipped:
+            clipped = clipped.rsplit(" ", 1)[0]
+        response_text = f"{clipped.rstrip(' ,;:-')}..."
+
+    return response_text
+
+
+def generate_conversation_response(
+    user_text,
+    llm_url=DEFAULT_LLM_URL,
+    http_client=None,
+):
+    if http_client is None:
+        try:
+            import requests
+        except ImportError as error:
+            raise ControllerError(
+                "The 'requests' package is not installed in this Python environment."
+            ) from error
+        http_client = requests
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{user_text}\n/no_think"},
+        ],
+        "temperature": 0.6,
+        "max_tokens": 160,
+    }
+
+    try:
+        response = http_client.post(llm_url, json=payload, timeout=60)
+        response.raise_for_status()
+    except Exception as error:
+        raise ControllerError(
+            f"Error communicating with LLM server: {error}"
+        ) from error
+
+    try:
+        response_text = response.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise ControllerError(
+            "Unexpected conversational response from LLM server."
+        ) from error
+
+    return clean_conversation_response(response_text)
+
+
+def validate_request(request):
+    if not isinstance(request, dict):
+        print("Classifier response was not an object; using conversation fallback.")
+        return "conversation", None, None
+
+    intent = request.get("intent")
+    # Older classifier prompts used "none" for unmatched requests. Treat any
+    # legacy-shaped output as conversation so it cannot dead-end.
+    if intent == "none":
+        print("Normalized request: none -> conversation")
+        return "conversation", None, None
+    if intent in NON_CONTROL_INTENTS:
+        print(f"Validated request: {intent}")
+        return intent, None, None
+    if intent != "control":
+        print(f"Unknown intent {intent!r}; using conversation fallback.")
+        return "conversation", None, None
+
+    device = request.get("device")
+    action = request.get("action")
+    if device not in ALLOWED_CONTROL_COMMANDS:
+        print(
+            f"Unconfigured control device {device!r}; "
+            "using conversation fallback."
+        )
+        return "conversation", None, None
+
+    if action not in ALLOWED_CONTROL_COMMANDS[device]:
+        print(
+            f"Unconfigured control action {device!r} -> {action!r}; "
+            "using conversation fallback."
+        )
+        return "conversation", None, None
+
+    print(f"Validated request: control {device} -> {action}")
+    return intent, device, action
+
+
+def execute_request(
+    request,
+    device_output,
+    weather,
+    now=None,
+    user_text=None,
+    llm_url=DEFAULT_LLM_URL,
+    conversation_client=None,
+):
+    intent, device, action = request
+    if intent == "control":
+        return device_output.apply(device, action)
+    if intent == "time":
+        return current_time_response(now=now)
+    if intent == "date":
+        return current_date_response(now=now)
+    if intent == "weather":
+        return weather.current_response()
+    if intent == "conversation":
+        if not user_text:
+            raise ControllerError(
+                "A conversational request requires the original text."
+            )
+        return generate_conversation_response(
+            user_text,
+            llm_url=llm_url,
+            http_client=conversation_client,
+        )
+    raise ControllerError(f"No handler is configured for intent: {intent}")
+
+
+def read_request(voice_input=None, wake_input=None):
     if wake_input is not None:
         return wake_input.listen()
 
     if voice_input is None:
-        return input("Command: ").strip()
+        return input("Request: ").strip()
 
     typed_text = input(
-        "Press Enter to speak, type a command, or type 'quit': "
+        "Press Enter to speak, type a request, or type 'quit': "
     ).strip()
     if typed_text:
         return typed_text
@@ -996,7 +1343,10 @@ def read_command(voice_input=None, wake_input=None):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Control the apartment LED using typed or spoken commands."
+        description=(
+            "Handle apartment controls, information requests, and short "
+            "conversations using typed or spoken input."
+        )
     )
     input_mode = parser.add_mutually_exclusive_group()
     input_mode.add_argument(
@@ -1008,13 +1358,13 @@ def parse_args(argv=None):
         "--listen",
         dest="listen",
         action="store_true",
-        help="continuously listen for a wake word before recording a command",
+        help="continuously listen for a wake word before recording a request",
     )
     parser.add_argument(
         "--record-seconds",
         type=int,
         default=5,
-        help="seconds to record for each spoken command (default: 5)",
+        help="seconds to record for each spoken request (default: 5)",
     )
     parser.add_argument(
         "--microphone",
@@ -1052,7 +1402,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--speak",
         action="store_true",
-        help="speak local ready and action responses with Piper",
+        help=(
+            "speak local ready, action, information, and conversational "
+            "responses with Piper"
+        ),
     )
     parser.add_argument(
         "--tts-model",
@@ -1094,6 +1447,12 @@ def parse_args(argv=None):
         help=f"local chat completions endpoint (default: {DEFAULT_LLM_URL})",
     )
     parser.add_argument(
+        "--weather-location",
+        help=(
+            'city or postal code for weather responses, for example "Boston, MA"'
+        ),
+    )
+    parser.add_argument(
         "--led-pin",
         type=int,
         default=DEFAULT_LED_PIN,
@@ -1122,6 +1481,7 @@ def main(argv=None):
     voice_input = None
     wake_input = None
     speech_output = None
+    weather = None
     led = None
 
     try:
@@ -1163,13 +1523,14 @@ def main(argv=None):
                 speech_output=speech_output,
             )
 
+        weather = OpenMeteoWeather(args.weather_location)
         led = GpioLed(args.led_pin)
 
         print("Apartment controller started.")
         if args.listen:
             print(
                 f'Listen mode enabled. Say "{args.wake_word}", wait for '
-                "the ready message, then speak the command."
+                "the ready message, then speak the request."
             )
         elif args.voice:
             print("Voice input enabled. Press Enter when you are ready to speak.")
@@ -1182,11 +1543,13 @@ def main(argv=None):
                 "Local speech responses enabled: "
                 f"{speech_output.speaker_label}."
             )
+        if args.weather_location:
+            print(f"Weather location: {args.weather_location}.")
         print("Type 'exit' or 'quit' to stop.\n")
 
         while True:
             try:
-                user_text = read_command(
+                user_text = read_request(
                     voice_input=voice_input if args.voice else None,
                     wake_input=wake_input,
                 )
@@ -1205,16 +1568,38 @@ def main(argv=None):
             if not user_text:
                 continue
 
+            request = None
             try:
-                device, action = interpret_command(user_text, args.llm_url)
-                action_response = led.apply(device, action)
+                request = interpret_request(user_text, args.llm_url)
+                response_text = execute_request(
+                    request,
+                    led,
+                    weather,
+                    user_text=user_text,
+                    llm_url=args.llm_url,
+                )
             except ControllerError as error:
                 print(f"{error}\n")
+                if speech_output is not None:
+                    failure_response = (
+                        "Sorry, I couldn't get the weather. Check the configured "
+                        "location and internet connection."
+                        if request is not None and request[0] == "weather"
+                        else "Sorry, I couldn't complete that request."
+                    )
+                    try:
+                        speech_output.speak(failure_response)
+                    except ControllerError as speech_error:
+                        print(f"Speech response failed: {speech_error}\n")
                 continue
 
-            if speech_output is not None and action_response:
+            if response_text and request[0] != "control":
+                print(f">>> {response_text}\n")
+                if request[0] == "weather":
+                    print(f"{OPEN_METEO_ATTRIBUTION}\n")
+            if speech_output is not None and response_text:
                 try:
-                    speech_output.speak(action_response)
+                    speech_output.speak(response_text)
                 except ControllerError as error:
                     print(f"Speech response failed: {error}\n")
 
