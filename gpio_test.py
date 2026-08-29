@@ -1,26 +1,31 @@
-import Jetson.GPIO as GPIO
+"""Blink the optional GPIO test LED until interrupted."""
+
 import time
 
-GPIO.setwarnings(False)
+import Jetson.GPIO as GPIO
 
-LED_PIN = 7
+from apartment_ai.constants import DEFAULT_LED_PIN
 
-GPIO.setmode(GPIO.BOARD)
-GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-try:
-    while True:
-        GPIO.output(LED_PIN, GPIO.HIGH)
-        print("LED ON")
-        time.sleep(2)
+def main():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(DEFAULT_LED_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-        GPIO.output(LED_PIN, GPIO.LOW)
-        print("LED OFF")
-        time.sleep(2)
+    try:
+        while True:
+            GPIO.output(DEFAULT_LED_PIN, GPIO.HIGH)
+            print("LED ON")
+            time.sleep(2)
+            GPIO.output(DEFAULT_LED_PIN, GPIO.LOW)
+            print("LED OFF")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        GPIO.output(DEFAULT_LED_PIN, GPIO.LOW)
+        GPIO.cleanup()
 
-except KeyboardInterrupt:
-    print("\nStopping...")
 
-finally:
-    GPIO.output(LED_PIN, GPIO.LOW)
-    GPIO.cleanup()
+if __name__ == "__main__":
+    main()

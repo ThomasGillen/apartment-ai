@@ -23,7 +23,9 @@ openWakeWord → local “Hey Jarvis” activation
     ↓
 whisper.cpp → post-activation request transcript
     ↓
-Qwen3-1.7B on llama.cpp → JSON request intent
+Python common lamp-command match
+    ├─ matched → validated on/off request
+    └─ otherwise → Qwen3-1.7B on llama.cpp → JSON request intent
     ↓
 Python allow-list validation
     ├─ control → local Shelly RPC → lamp-1 and lamp-2
@@ -37,7 +39,32 @@ Python allow-list validation
 
 The LLM never accesses the Shelly outlets, GPIO, the system clock, or the
 weather service directly. Voice and typed requests both enter the same
-validation and response path.
+validation and response path. Unambiguous phrases such as “lights on,” “lights
+off,” and Whisper's “light's on” spelling bypass the LLM classifier and map
+directly to the allow-listed living-room-lamp action. Questions about lamp state
+still go through normal classification and cannot trigger that shortcut.
+
+## Repository layout
+
+```text
+apartment_controller.py     stable launcher and compatibility imports
+apartment_ai/
+├── audio.py                ALSA capture, Whisper, microphones, and speakers
+├── wake.py                 openWakeWord and Whisper fallback detection
+├── speech.py               Piper synthesis and audio playback
+├── intent.py               direct commands, LLM classification, validation
+├── devices.py              Shelly outlet group and optional GPIO LED
+├── weather.py              time, date, and Open-Meteo responses
+├── cli.py                  options and controller lifecycle
+├── constants.py            shared configuration defaults
+└── errors.py               expected user-facing controller errors
+test_apartment_controller.py regression tests for every subsystem
+gpio_test.py                standalone optional LED wiring test
+```
+
+The existing Jetson commands are unchanged. The top-level controller is now a
+small entry point; implementation changes belong in the focused module for that
+subsystem.
 
 ## One-time setup versus daily use
 

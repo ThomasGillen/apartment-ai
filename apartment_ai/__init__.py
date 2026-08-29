@@ -1,0 +1,2 @@
+"""Apartment AI controller package."""
+

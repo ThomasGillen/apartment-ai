@@ -29,6 +29,7 @@ from apartment_controller import (
     interpret_request,
     main,
     parse_args,
+    parse_direct_lamp_request,
     parse_outlet_target,
     resolve_microphone,
     resolve_system_sink,
@@ -37,6 +38,36 @@ from apartment_controller import (
 
 
 class RequestValidationTests(unittest.TestCase):
+    def test_common_lamp_commands_skip_the_llm(self):
+        client = Mock()
+        phrases = {
+            "Lights on.": "on",
+            "Light's off.": "off",
+            "Light’s on.": "on",
+            "Living room lamps on": "on",
+            "Please turn the lights off.": "off",
+            "Can you switch on the living room lights?": "on",
+        }
+
+        for phrase, action in phrases.items():
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    interpret_request(phrase, http_client=client),
+                    ("control", "desk_lamp", action),
+                )
+
+        client.post.assert_not_called()
+
+    def test_direct_lamp_match_rejects_state_questions_and_statements(self):
+        for phrase in (
+            "Are the lights on?",
+            "The lights are off.",
+            "Why are the lamps on?",
+            "The light is on.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(parse_direct_lamp_request(phrase))
+
     def test_allows_known_lamp_command(self):
         self.assertEqual(
             validate_request(
@@ -310,7 +341,7 @@ class WeatherResponseTests(unittest.TestCase):
 
 
 class VoiceInputTests(unittest.TestCase):
-    @patch("apartment_controller.subprocess.run")
+    @patch("apartment_ai.audio.subprocess.run")
     def test_records_then_transcribes(self, run):
         def fake_run(command, **kwargs):
             if Path(command[0]).name == "whisper-cli":
@@ -339,7 +370,7 @@ class VoiceInputTests(unittest.TestCase):
 
 
 class ContinuousAudioTests(unittest.TestCase):
-    @patch("apartment_controller.subprocess.Popen")
+    @patch("apartment_ai.audio.subprocess.Popen")
     def test_starts_arecord_with_supported_raw_file_type_option(self, popen):
         process = Mock()
         process.poll.return_value = 1
@@ -584,7 +615,7 @@ class SpeechOutputTests(unittest.TestCase):
         wav_file.setframerate(22050)
         wav_file.writeframes(b"\x00\x00")
 
-    @patch("apartment_controller.shutil.which")
+    @patch("apartment_ai.speech.shutil.which")
     def test_loads_piper_on_cpu_and_plays_selected_alsa_device(self, which):
         which.side_effect = lambda player: (
             "/usr/bin/aplay" if player == "aplay" else None
@@ -623,7 +654,7 @@ class SpeechOutputTests(unittest.TestCase):
             self.assertIn("plughw:3,0", play_command)
             self.assertEqual(Path(play_command[-1]).name, "response.wav")
 
-    @patch("apartment_controller.shutil.which")
+    @patch("apartment_ai.speech.shutil.which")
     def test_prefers_system_audio_for_bluetooth_output(self, which):
         available = {
             "paplay": "/usr/bin/paplay",
@@ -653,7 +684,7 @@ class SpeechOutputTests(unittest.TestCase):
             self.assertEqual(play_command[0], "paplay")
             self.assertEqual(Path(play_command[-1]).name, "response.wav")
 
-    @patch("apartment_controller.shutil.which")
+    @patch("apartment_ai.speech.shutil.which")
     def test_routes_to_manually_selected_friendly_system_speaker(self, which):
         which.side_effect = lambda player: (
             "/usr/bin/paplay" if player == "paplay" else None
@@ -694,7 +725,7 @@ class SpeechOutputTests(unittest.TestCase):
             )
             self.assertEqual(speech_output.speaker_label, "Living Room Speaker")
 
-    @patch("apartment_controller.shutil.which")
+    @patch("apartment_ai.speech.shutil.which")
     def test_falls_back_when_first_system_player_fails(self, which):
         available = {
             "paplay": "/usr/bin/paplay",
@@ -728,7 +759,7 @@ class SpeechOutputTests(unittest.TestCase):
 
 
 class SystemAudioSinkTests(unittest.TestCase):
-    @patch("apartment_controller.shutil.which", return_value="/usr/bin/pactl")
+    @patch("apartment_ai.audio.shutil.which", return_value="/usr/bin/pactl")
     def test_reads_system_speakers_from_pactl_json(self, _which):
         pactl_output = json.dumps(
             [
@@ -783,7 +814,7 @@ class SystemAudioSinkTests(unittest.TestCase):
 
 
 class MicrophoneSelectionTests(unittest.TestCase):
-    @patch("apartment_controller.shutil.which", return_value="/usr/bin/arecord")
+    @patch("apartment_ai.audio.shutil.which", return_value="/usr/bin/arecord")
     def test_reads_stable_microphone_selectors_from_arecord(self, _which):
         arecord_output = """\
 **** List of CAPTURE Hardware Devices ****
@@ -1013,7 +1044,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertFalse(args.gpio)
         self.assertIsNone(args.outlet_hosts)
 
-    @patch.dict("apartment_controller.os.environ", {}, clear=True)
+    @patch.dict("apartment_ai.devices.os.environ", {}, clear=True)
     def test_default_output_builds_the_two_named_outlets(self):
         output = create_device_output(parse_args([]))
 
@@ -1048,18 +1079,18 @@ class CommandLineTests(unittest.TestCase):
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             parse_args(["--gpio", "--outlet", "lamp-1"])
 
-    @patch("apartment_controller.print_available_speakers")
+    @patch("apartment_ai.cli.print_available_speakers")
     def test_speaker_listing_exits_before_hardware_initialization(self, listing):
         self.assertEqual(main(["--list-speakers"]), 0)
         listing.assert_called_once_with()
 
-    @patch("apartment_controller.print_available_microphones")
+    @patch("apartment_ai.cli.print_available_microphones")
     def test_microphone_listing_exits_before_hardware_initialization(self, listing):
         self.assertEqual(main(["--list-microphones"]), 0)
         listing.assert_called_once_with()
 
-    @patch("apartment_controller.print_available_microphones")
-    @patch("apartment_controller.print_available_speakers")
+    @patch("apartment_ai.cli.print_available_microphones")
+    @patch("apartment_ai.cli.print_available_speakers")
     def test_combined_audio_listing_exits_before_hardware_initialization(
         self,
         speakers,
@@ -1069,7 +1100,7 @@ class CommandLineTests(unittest.TestCase):
         speakers.assert_called_once_with()
         microphones.assert_called_once_with()
 
-    @patch("apartment_controller.download_openwakeword_model")
+    @patch("apartment_ai.cli.download_openwakeword_model")
     def test_wake_model_download_exits_before_hardware_initialization(
         self,
         download,
